@@ -338,20 +338,31 @@ whose config has `contentType: 'diff'`. Expanding it renders the run's real
 
 ## Subagents
 
-**RULE: a row is a subagent container when the backend attached agent metadata to it, or
-its tool name is `Task` or `Agent`.**
+**RULE: a row is a subagent container when the backend attached agent metadata to it, a
+live task status named it, or its tool name is `Task` or `Agent`.**
 
-`normalizedToChatMessages` sets `isSubagentContainer` from
-`Boolean(msg.subagent) || toolName === 'Task' || toolName === 'Agent'`. The name check
-covers a live spawn whose metadata has not been indexed yet. `MessageComponent` then hands
-the whole row to `SubagentPanel` and never calls `ToolRenderer` for it.
+`normalizedToChatMessages` sets `isSubagentContainer` from `Boolean(subagent)`, where
+`subagent` is the history-attached metadata merged with the newest live task status, and
+falls back to `toolName === 'Task' || toolName === 'Agent'` for the moment before either
+has arrived. `MessageComponent` then hands the whole row to `SubagentPanel` and never calls
+`ToolRenderer` for it.
 
 The panel's header shows the agent type, description, nickname, and a status of running,
-failed, or `N tools` — `done` when the agent completed without running any. While open it
-shows the model, the task prompt, the timeline, and the agent's markdown result. A timeline
-entry of `kind: 'tool'` goes through `ToolRenderer` with `mode="input"` — the same router
-the main thread uses — so a subagent's shell command looks identical to the parent's.
-Entries of kind `text` and `thinking` render as notes.
+stopped, failed, or `N tools` — `done` when the agent completed without running any. While
+open it shows the model, the running token/tool totals when the provider reports them, the
+task prompt, the timeline, and the agent's markdown result. A timeline entry of
+`kind: 'tool'` goes through `ToolRenderer` with `mode="input"` — the same router the main
+thread uses — so a subagent's shell command looks identical to the parent's. Entries of
+kind `text` and `thinking` render as notes.
+
+**Where the status comes from.** `resolveSubagentStatus` in
+`src/modules/chat/subagents/subagentStatus.ts` is the only place a lifecycle state is
+decided: the provider's reported status wins, and only an agent without one is inferred
+from its result. That inference must never read a launch acknowledgement as an answer — an
+async agent's result comes back the instant it is admitted, which is what made a
+still-running agent render as finished. The four states and how each is drawn live in
+`SUBAGENT_STATUS_PRESENTATION`, shared with the subagent list so one agent is never
+described two ways.
 
 Two caps matter. `INITIALLY_RENDERED_ACTIVITIES = 25` bounds how many entries mount, and
 the "show N more" button raises the limit by four times that. Separately,
@@ -377,7 +388,28 @@ lists wins** — a mid-run refresh can attach a partial server timeline while ne
 keep streaming. The projection cache's second key, `subagentActivitySource`, holds the
 newest row folded into that container, so a growing timeline invalidates the cached card.
 
-`src/modules/chat/tests/liveSubagentGrouping.test.ts` pins all four behaviours.
+**The live task stream.** The rows above describe what an agent *did*; they cannot say
+whether it is still doing it. Claude sends that separately, as `system` task events that
+`normalizeClaudeTaskEvent` in `claude-sessions.provider.ts` turns into `subagent_update`
+frames carrying the spawning `tool_use_id`. `task_started` and `task_progress` keep the
+agent running and carry its token/tool totals; `task_notification` closes it. Three
+consequences worth holding:
+
+- **A status is folded, never drawn.** The first pass collects the newest status per
+  `toolUseId`; the second pass skips those frames entirely, and the container merges them
+  over its history metadata. The projection cache's third key, `subagentStateSource`,
+  holds the newest status so a card is rebuilt when its agent moves on.
+- **Live status outranks history.** A mid-run reload ships the agent as finished because
+  the backend can only read its transcript; the stream is the only side that knows better.
+- **A cancellation is not a failure.** `stopped` is its own state, end to end, so an agent
+  the user cancelled is not drawn as a broken one.
+
+`SubagentsPanel` (`src/modules/chat/subagents/`) is the always-reachable index over the
+same data: it lists every agent in the session, expands itself while one is active, and
+scrolling to a card is driven through `SubagentFocusContext`.
+
+`src/modules/chat/tests/liveSubagentGrouping.test.ts` pins the folding behaviours, and
+`src/modules/chat/tests/subagentStatus.test.ts` pins the status resolution.
 
 ## Errors
 

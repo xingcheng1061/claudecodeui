@@ -11,6 +11,8 @@ import type {
   FetchHistoryResult,
   LLMProvider,
   NormalizedMessage,
+  SubagentActivity,
+  SubagentInfo,
 } from '@/shared/types.js';
 import { AppError, sliceTailPage } from '@/shared/utils.js';
 
@@ -487,6 +489,63 @@ export const sessionsService = {
         sessionId,
       })),
     };
+  },
+
+  /**
+   * Every subagent a session spawned, independent of how much of the transcript the client
+   * happens to have loaded.
+   *
+   * The panel that draws these used to read them off the loaded messages, so an agent
+   * vanished as soon as the page holding its spawn row was not loaded — the spawn, and
+   * everything the agent then did, was invisible for no better reason than the paging
+   * window. `limit: null` is the whole point of this call: ask the reader for the entire
+   * conversation, then hand back only the agents found in it.
+   *
+   * Deduplicated by the row that spawned the agent, later rows winning, which is the rule
+   * the client already applied when it derived the same list from its own messages.
+   */
+  async listSessionSubagents(sessionId: string): Promise<{ subagents: SubagentInfo[] }> {
+    const history = await this.fetchHistory(sessionId, { limit: null, offset: 0 });
+
+    // Insertion-ordered, so the panel lists agents in the order they were spawned.
+    const bySpawnRow = new Map<string, SubagentInfo>();
+    for (const message of history.messages) {
+      const subagent = message.subagent;
+      if (!subagent) {
+        continue;
+      }
+      bySpawnRow.set(String(subagent.toolUseId ?? message.toolId ?? subagent.id), subagent);
+    }
+
+    return { subagents: [...bySpawnRow.values()] };
+  },
+
+  /**
+   * One subagent's full activity timeline, for the panel's on-demand expansion.
+   *
+   * An empty list rather than a throw when the provider keeps no per-agent transcript: the
+   * agent is real either way, the panel already has its summary, and "this provider cannot
+   * serve the long-form read" is not something the reader can act on.
+   */
+  async fetchSubagentTranscript(
+    sessionId: string,
+    agentId: string,
+  ): Promise<{ activity: SubagentActivity[] }> {
+    const session = sessionsDb.getSessionById(sessionId);
+    if (!session) {
+      throw new AppError(`Session "${sessionId}" was not found.`, {
+        code: 'SESSION_NOT_FOUND',
+        statusCode: 404,
+      });
+    }
+
+    const sessions = providerRegistry.resolveProvider(session.provider as LLMProvider).sessions;
+    const activity = await sessions.fetchSubagentTranscript?.(sessionId, agentId, {
+      projectPath: session.project_path ?? '',
+      providerSessionId: session.provider_session_id ?? undefined,
+    });
+
+    return { activity: activity ?? [] };
   },
 
   /**

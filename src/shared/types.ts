@@ -263,7 +263,6 @@ export type SubagentActivity = {
   content?: string;
 };
 
-/** Identity and lifecycle of one spawned subagent as the backend reports it; present on the tool call that spawned the agent and used to draw its container header. */
 /**
  * A compaction, as the transcript records it.
  *
@@ -280,15 +279,32 @@ export type CompactionInfo = {
   error?: string | null;
 };
 
+/** Lifecycle state of one subagent; `running` is live, the rest terminal. `stopped` separates a cancellation from a failure so a cancelled agent is not drawn as broken. */
+export type SubagentStatus = 'running' | 'completed' | 'failed' | 'stopped';
+
+/** Running token and tool totals for one subagent; a cumulative figure rather than a delta, so the last value received is the agent's whole cost. */
+export type SubagentUsage = {
+  totalTokens: number;
+  toolUses: number;
+  durationMs: number;
+};
+
+/** Identity and lifecycle of one spawned subagent as the backend reports it; present on the tool call that spawned the agent and used to draw its container header and its row in the subagent list. */
 export type SubagentInfo = {
   id: string;
   name?: string;
   type?: string;
   description?: string;
-  status: 'running' | 'completed' | 'failed';
+  status: SubagentStatus;
   model?: string;
   /** Total entries the agent recorded, which exceeds the received timeline when a long run was truncated for transport. */
   activityCount?: number;
+  /** The tool call that spawned this agent, used to fold live updates into that row and to scroll back to it from the subagent list. */
+  toolUseId?: string;
+  /** Whether the backend still holds a handle for this agent and can stop it on its own; set only by the runtime, and read — never inferred — by the UI. */
+  canInterrupt?: boolean;
+  /** Running token/tool totals, when the provider reports them. */
+  usage?: SubagentUsage;
 };
 
 /** One rendered entry in a chat transcript — user turn, assistant turn, tool call and result, local command output, or subagent container — and the shape the chat message list and message components consume. */
@@ -507,12 +523,13 @@ export type NormalizedMessage = {
   rowid?: number;
 };
 
-/** Discriminator on NormalizedMessage naming which kind of transcript event it carries — plain text, tool use or result, thinking, stream delta or end, error, completion, status, permission request/resolution/cancellation, session creation, interactive prompt, or task notification. */
+/** Discriminator on NormalizedMessage naming which kind of transcript event it carries — plain text, tool use or result, thinking, stream delta or end, error, completion, status, permission request/resolution/cancellation, session creation, interactive prompt, task notification, or a subagent lifecycle update. */
 type MessageKind =
   | 'text'
   | 'tool_use'
   | 'tool_result'
   | 'thinking'
+  | 'thinking_delta'
   | 'stream_delta'
   | 'stream_end'
   | 'error'
@@ -523,7 +540,8 @@ type MessageKind =
   | 'permission_cancelled'
   | 'session_created'
   | 'history_truncated'
-  | 'task_notification';
+  | 'task_notification'
+  | 'subagent_update';
 
 // ---------------------------
 

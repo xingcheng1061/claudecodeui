@@ -217,6 +217,46 @@ test('Claude history attaches a subagent transcript stored under the session dir
   }
 });
 
+test('Claude history keeps an agent card when its transcript cannot be found', { concurrency: false }, async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'claude-subagent-missing-'));
+
+  try {
+    const parentPath = await writeClaudeSubagentSession(tempRoot);
+    // The sidechain may be missing for reasons that say nothing about the
+    // agent: an older CLI laid it out elsewhere, or it has since been cleaned
+    // up. The spawn is still in the parent transcript, and that is all the card
+    // needs in order to exist.
+    await rm(path.join(tempRoot, SESSION_ID), { recursive: true, force: true });
+
+    await withIsolatedDatabase(async () => {
+      const now = new Date().toISOString();
+      sessionsDb.createSession(SESSION_ID, 'claude', tempRoot, 'Subagent session', now, now, parentPath);
+
+      const history = await new ClaudeSessionsProvider().fetchHistory(SESSION_ID, {
+        providerSessionId: SESSION_ID,
+      });
+      const agentRow = history.messages.find(
+        (message) => message.kind === 'tool_use' && message.toolId === AGENT_TOOL_USE_ID,
+      );
+
+      assert.ok(agentRow, 'the Agent call must be in the transcript');
+      // Previously the agent was dropped outright, collapsing the card back
+      // into an anonymous tool call with no way to reach the agent from it.
+      assert.ok(agentRow.subagent, 'the card must survive an unreadable transcript');
+      assert.equal(agentRow.subagent?.id, AGENT_ID);
+      assert.equal(agentRow.subagent?.toolUseId, AGENT_TOOL_USE_ID);
+      assert.equal(agentRow.subagent?.description, 'Survey the repo');
+      assert.equal(agentRow.subagent?.activityCount, 0);
+      assert.equal(agentRow.subagentTools, undefined, 'there is no timeline to show');
+      // The sidechain is gone, but the task notification is not: the agent's
+      // outcome is still known, and only its timeline is missing.
+      assert.equal(agentRow.subagent?.status, 'completed');
+    });
+  } finally {
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
 test('Claude history folds an agent task notification into the call that spawned it', { concurrency: false }, async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'claude-notification-'));
 

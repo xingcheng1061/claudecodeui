@@ -16,6 +16,7 @@ import type {
   ProviderRuntimeContext,
   ProviderRuntimePermissionGateway,
   ProviderRuntimeWriter,
+  SubagentActivity,
   UpsertProviderMcpServerInput,
 } from '@/shared/types.js';
 
@@ -35,6 +36,14 @@ export interface IProviderRuntime {
     context: ProviderRuntimeContext,
   ): Promise<unknown>;
   abort(sessionId: string): boolean | Promise<boolean>;
+  /**
+   * Stops one agent this runtime started, named by the tool call that spawned it.
+   *
+   * Optional, like `permissions`: a provider whose runtime has no per-task control
+   * channel leaves it out, and the application service reports the request as
+   * unsupported rather than quietly succeeding at nothing.
+   */
+  abortSubagent?(sessionId: string, toolUseId: string): boolean | Promise<boolean>;
   permissions?: ProviderRuntimePermissionGateway;
 }
 
@@ -216,6 +225,23 @@ export interface IProviderSessions {
    * gateway branches on.
    */
   rewindSession?(sessionId: string, keepThroughId: string | null): Promise<void>;
+
+  /**
+   * One spawned agent's own transcript, read in full rather than from the copy the
+   * parent's rows carry.
+   *
+   * The activity hung off a session's message rows is capped for transport, so it can only
+   * ever summarise a long-running agent. This is the read behind a reader asking to see one
+   * agent in full, and it runs on demand rather than with every page. It returns null when
+   * the provider keeps no per-agent transcript, which is most of them — the capability is
+   * optional for that reason, and its absence is reported as "no long-form read available"
+   * rather than as an error.
+   */
+  fetchSubagentTranscript?(
+    sessionId: string,
+    agentId: string,
+    options?: FetchHistoryOptions,
+  ): Promise<SubagentActivity[] | null>;
 }
 
 // ---------------------------

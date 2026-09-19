@@ -3,8 +3,9 @@
  * Converts NormalizedMessage[] from the session store into ChatMessage[] for the UI.
  */
 
-import type { ChatMessage,NormalizedMessage,SubagentActivity } from '@/shared/types';
+import type { ChatMessage,NormalizedMessage,SubagentActivity,SubagentInfo } from '@/shared/types';
 import { formatUsageLimitText } from '@/modules/chat/utils/chatFormatting';
+import { isStreamingRow } from '@/modules/chat/hooks/useSessionStore';
 
 function formatToolResultContent(content: unknown): string {
   const text = typeof content === 'string' ? content : JSON.stringify(content);
@@ -25,6 +26,8 @@ type CachedMessageProjection = {
   toolResultSource: ToolResultSource;
   /** A live subagent container also depends on the newest row folded into its timeline. */
   subagentActivitySource: NormalizedMessage | null;
+  /** A live subagent container also depends on the newest task status for its agent. */
+  subagentStateSource: NormalizedMessage | null;
   messages: ChatMessage[];
 };
 
@@ -182,6 +185,42 @@ function appendCompactionRow(
   return true;
 }
 
+/**
+ * Merges the subagent record read from history with the newest live task status
+ * for the same agent.
+ *
+ * The two disagree by nature: history reads the agent's own finished transcript,
+ * while the live task stream is the only thing that knows the agent is still
+ * going. Identity and the timeline therefore come from whichever side has them,
+ * and the live status wins because it is always the more recent of the two — a
+ * history reload that lands mid-run must not put a running agent back to
+ * `completed`.
+ */
+export function mergeSubagentState(
+  fromHistory: SubagentInfo | undefined,
+  live: SubagentInfo | undefined,
+): SubagentInfo | undefined {
+  if (!fromHistory) {
+    return live;
+  }
+  if (!live) {
+    return fromHistory;
+  }
+
+  return {
+    ...fromHistory,
+    status: live.status,
+    type: live.type ?? fromHistory.type,
+    description: live.description ?? fromHistory.description,
+    usage: live.usage ?? fromHistory.usage,
+    // Not a preference between two sources: only the live side ever knows whether
+    // the runtime still holds a handle for the agent, and a history read never sets
+    // it. Carrying it across is what keeps the stop control alive through a reload
+    // that lands mid-run — the moment a history read would otherwise drop it.
+    canInterrupt: live.canInterrupt ?? fromHistory.canInterrupt,
+  };
+}
+
 export function normalizedToChatMessages(messages: NormalizedMessage[]): ChatMessage[] {
   const converted: ChatMessage[] = [];
 
@@ -196,7 +235,22 @@ export function normalizedToChatMessages(messages: NormalizedMessage[]): ChatMes
   const liveSubagentToolsById = new Map<string, SubagentActivity>();
   /** Newest folded row per container, so its cached projection knows to rebuild. */
   const lastSubagentSourceByParent = new Map<string, NormalizedMessage>();
+  /**
+   * Newest task status per spawning tool call. The server sends one of these
+   * per lifecycle transition, and each is folded into the container it names
+   * instead of being drawn as a row of its own — the transition is a property
+   * of the agent's card, not something the agent said.
+   */
+  const liveSubagentState = new Map<string, { source: NormalizedMessage; info: SubagentInfo }>();
   for (const msg of messages) {
+    if (msg.kind === 'subagent_update') {
+      const toolUseId = msg.toolId || msg.subagent?.toolUseId;
+      if (toolUseId && msg.subagent) {
+        liveSubagentState.set(toolUseId, { source: msg, info: msg.subagent });
+      }
+      continue;
+    }
+
     if (msg.parentToolUseId) {
       const parentId = msg.parentToolUseId;
       let activity = liveSubagentActivity.get(parentId);
@@ -272,8 +326,9 @@ export function normalizedToChatMessages(messages: NormalizedMessage[]): ChatMes
   const foldedSummaries = new Set<string>();
 
   for (const msg of messages) {
-    // Subagent rows were folded into their container's timeline above.
-    if (msg.parentToolUseId) {
+    // Subagent rows were folded into their container's timeline above, and a
+    // task status was folded into the card it belongs to.
+    if (msg.parentToolUseId || msg.kind === 'subagent_update') {
       continue;
     }
 
@@ -283,14 +338,20 @@ export function normalizedToChatMessages(messages: NormalizedMessage[]): ChatMes
     const subagentActivitySource = msg.kind === 'tool_use' && msg.toolId
       ? lastSubagentSourceByParent.get(msg.toolId) ?? null
       : null;
+    const subagentState = msg.kind === 'tool_use' && msg.toolId
+      ? liveSubagentState.get(msg.toolId) ?? null
+      : null;
+    const subagentStateSource = subagentState?.source ?? null;
     const cachedProjection = projectionCache.get(msg);
 
     // A tool-use projection must be rebuilt when a matching result arrives,
     // even though the original tool-use record itself is unchanged. The same
-    // holds for a subagent container when its live timeline grows.
+    // holds for a subagent container when its live timeline grows or its task
+    // status moves on.
     if (
       cachedProjection?.toolResultSource === toolResultSource
       && cachedProjection.subagentActivitySource === subagentActivitySource
+      && cachedProjection.subagentStateSource === subagentStateSource
     ) {
       converted.push(...cachedProjection.messages);
       continue;
@@ -361,6 +422,11 @@ export function normalizedToChatMessages(messages: NormalizedMessage[]): ChatMes
           const text = formatUsageLimitText(content);
           converted.push({
             type: 'assistant',
+            // Carried so the row keeps one identity. A live answer is this row, rewritten
+            // on every stream tick with more text and a fresh timestamp — and without an
+            // id `getIntrinsicMessageKey` falls back to exactly those two fields, which
+            // hands the row a new React key, and a remount, ten times a second.
+            id: msg.id,
             content: text,
             timestamp: msg.timestamp,
             memoryCitations: msg.memoryCitations,
@@ -373,10 +439,12 @@ export function normalizedToChatMessages(messages: NormalizedMessage[]): ChatMes
       case 'tool_use': {
         const tr = toolResultSource;
         // A row is a subagent container when the backend attached agent
-        // metadata to it. Both providers normalize to that, so no provider or
-        // tool-name special-casing is needed here; the name check only covers
-        // a live spawn whose metadata has not been indexed yet.
-        const isSubagentContainer = Boolean(msg.subagent)
+        // metadata to it, or when a live task status named it — the status can
+        // arrive for a spawn whose metadata has not been indexed yet. Both
+        // providers normalize to that, so no provider special-casing is needed
+        // here; the name check only covers the moment before either arrives.
+        const subagent = mergeSubagentState(msg.subagent, subagentState?.info);
+        const isSubagentContainer = Boolean(subagent)
           || msg.toolName === 'Task'
           || msg.toolName === 'Agent';
 
@@ -409,7 +477,7 @@ export function normalizedToChatMessages(messages: NormalizedMessage[]): ChatMes
           toolResult,
           toolStatus: typeof msg.status === 'string' ? msg.status : undefined,
           isSubagentContainer,
-          subagent: msg.subagent,
+          subagent,
           subagentActivity,
           memoryCitations: msg.memoryCitations,
           ...sharedMetadata,
@@ -421,9 +489,19 @@ export function normalizedToChatMessages(messages: NormalizedMessage[]): ChatMes
         if (msg.content?.trim()) {
           converted.push({
             type: 'assistant',
+            // The reasoning disclosure keeps its open state inside this row, so a key that
+            // changes as the text grows does more than remount a component: it hands the
+            // reader's collapse back to `defaultOpen ?? isStreaming`, which is *open* for
+            // as long as the reasoning streams. The block could therefore be opened but
+            // never shut. The id is what holds the row's identity still.
+            id: msg.id,
             content: msg.content,
             timestamp: msg.timestamp,
             isThinking: true,
+            // Live reasoning streams into a row under a well-known id, and the block
+            // reads this to stay open while it grows. Without it the reasoning is still
+            // there but drawn shut, which is indistinguishable from not showing it.
+            isStreaming: isStreamingRow(msg),
             ...sharedMetadata,
           });
         }
@@ -453,6 +531,10 @@ export function normalizedToChatMessages(messages: NormalizedMessage[]): ChatMes
         if (msg.content) {
           converted.push({
             type: 'assistant',
+            // This row *is* the live answer: the store writes it under one well-known id
+            // and replaces it on every tick, so the id is the only part of it that holds
+            // still. Same fallback-key problem as the answer's settled form below.
+            id: msg.id,
             content: msg.content,
             timestamp: msg.timestamp,
             isStreaming: true,
@@ -510,6 +592,7 @@ export function normalizedToChatMessages(messages: NormalizedMessage[]): ChatMes
     projectionCache.set(msg, {
       toolResultSource,
       subagentActivitySource,
+      subagentStateSource,
       // One source record can produce zero, one, or two UI messages (task
       // notifications with a result produce two), so cache the whole slice.
       messages: converted.slice(convertedStart),

@@ -14,6 +14,51 @@ const hasActionablePermissionRequests = (requests: Array<{ toolName?: unknown }>
   return Array.isArray(requests) && requests.some((request) => isActionablePermissionRequest(request));
 };
 
+/**
+ * How long streaming increments are buffered before their row is rewritten.
+ *
+ * Each flush replaces a whole row, so it costs a store update and a React commit —
+ * batching is what keeps a long answer from committing once per token.
+ */
+const STREAM_FLUSH_MS = 100;
+
+/**
+ * Writes the answer and reasoning rows from their accumulators.
+ *
+ * Both channels are written together. They arrive on one stream and are buffered on
+ * one tick, so flushing them apart would let a tick land on the answer while the
+ * reasoning that produced it was still sitting in a buffer — and the two would swap
+ * places on screen.
+ *
+ * Takes everything it needs as arguments rather than closing over it, because this
+ * runs on the hot path: a fresh closure per frame to capture the same values is work
+ * the batching above exists to avoid.
+ */
+function flushStreamRows({
+  sessionId,
+  provider,
+  sessionStore,
+  accumulatedStreamRef,
+  accumulatedThinkingRef,
+}: {
+  sessionId: string | null;
+  provider: LLMProvider;
+  sessionStore: SessionStore;
+  accumulatedStreamRef: MutableRefObject<string>;
+  accumulatedThinkingRef: MutableRefObject<string>;
+}): void {
+  if (!sessionId) {
+    return;
+  }
+
+  if (accumulatedStreamRef.current) {
+    sessionStore.updateStreaming(sessionId, accumulatedStreamRef.current, provider);
+  }
+  if (accumulatedThinkingRef.current) {
+    sessionStore.updateStreaming(sessionId, accumulatedThinkingRef.current, provider, 'thinking');
+  }
+}
+
 type UseChatRealtimeHandlersArgs = {
   isActive: boolean;
   subscribe: (listener: (event: ServerEvent) => void) => () => void;
@@ -81,6 +126,9 @@ export function useChatRealtimeHandlers({
   activeViewSessionIdRef.current = selectedSession?.id || currentSessionId || null;
   const isActiveRef = useRef(isActive);
   isActiveRef.current = isActive;
+  // Reasoning accumulates apart from the answer: same stream, its own row. Local
+  // rather than a prop, because nothing outside this hook reads it.
+  const accumulatedThinkingRef = useRef('');
 
   // Keep the latest pending-permission snapshot available to the websocket
   // listener so back-to-back permission events can dedupe and re-arm the
@@ -186,6 +234,26 @@ export function useChatRealtimeHandlers({
       /* -------------------------------------------------------------- */
 
       // --- Streaming: buffer for performance ---
+      if (msg.kind === 'thinking_delta') {
+        const text = (msg.content as string) || '';
+        if (!text) return;
+        accumulatedThinkingRef.current += text;
+        if (!streamTimerRef.current) {
+          streamTimerRef.current = window.setTimeout(() => {
+            streamTimerRef.current = null;
+            flushStreamRows({ sessionId: sid, provider, sessionStore, accumulatedStreamRef, accumulatedThinkingRef });
+          }, STREAM_FLUSH_MS);
+        }
+        // Also route to store for non-active sessions, exactly as the answer does.
+        // Nothing renders from these rows — a `thinking_delta` is not a drawable
+        // kind — but the answer's are handled the same way, and a session the reader
+        // is not looking at gets its reasoning from the completed block anyway.
+        if (sid && sid !== activeViewSessionId) {
+          sessionStore.appendRealtime(sid, msg as unknown as NormalizedMessage);
+        }
+        return;
+      }
+
       if (msg.kind === 'stream_delta') {
         const text = (msg.content as string) || '';
         if (!text) return;
@@ -193,10 +261,8 @@ export function useChatRealtimeHandlers({
         if (!streamTimerRef.current) {
           streamTimerRef.current = window.setTimeout(() => {
             streamTimerRef.current = null;
-            if (sid) {
-              sessionStore.updateStreaming(sid, accumulatedStreamRef.current, provider);
-            }
-          }, 100);
+            flushStreamRows({ sessionId: sid, provider, sessionStore, accumulatedStreamRef, accumulatedThinkingRef });
+          }, STREAM_FLUSH_MS);
         }
         // Also route to store for non-active sessions
         if (sid && sid !== activeViewSessionId) {
@@ -210,13 +276,16 @@ export function useChatRealtimeHandlers({
           clearTimeout(streamTimerRef.current);
           streamTimerRef.current = null;
         }
+        flushStreamRows({ sessionId: sid, provider, sessionStore, accumulatedStreamRef, accumulatedThinkingRef });
         if (sid) {
-          if (accumulatedStreamRef.current) {
-            sessionStore.updateStreaming(sid, accumulatedStreamRef.current, provider);
-          }
+          // Renames both rows, so the next turn's increments start a new one instead
+          // of rewriting this turn's. Called even when nothing was buffered: a row
+          // left over from an interrupted stream is still a row.
           sessionStore.finalizeStreaming(sid);
+          sessionStore.finalizeStreaming(sid, 'thinking');
         }
         accumulatedStreamRef.current = '';
+        accumulatedThinkingRef.current = '';
         return;
       }
 
@@ -240,11 +309,18 @@ export function useChatRealtimeHandlers({
             clearTimeout(streamTimerRef.current);
             streamTimerRef.current = null;
           }
-          if (sid && accumulatedStreamRef.current) {
-            sessionStore.updateStreaming(sid, accumulatedStreamRef.current, provider);
-            sessionStore.finalizeStreaming(sid);
+          if (sid) {
+            if (accumulatedStreamRef.current) {
+              sessionStore.updateStreaming(sid, accumulatedStreamRef.current, provider);
+              sessionStore.finalizeStreaming(sid);
+            }
+            if (accumulatedThinkingRef.current) {
+              sessionStore.updateStreaming(sid, accumulatedThinkingRef.current, provider, 'thinking');
+              sessionStore.finalizeStreaming(sid, 'thinking');
+            }
           }
           accumulatedStreamRef.current = '';
+          accumulatedThinkingRef.current = '';
 
           // `complete` is the unified terminal event — every provider run ends
           // with exactly one, regardless of success, failure, or abort. The

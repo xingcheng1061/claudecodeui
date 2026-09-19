@@ -51,6 +51,55 @@ const supersededInstances = new WeakSet();
 
 const TOOL_APPROVAL_TIMEOUT_MS = parseInt(process.env.CLAUDE_TOOL_APPROVAL_TIMEOUT_MS, 10) || 55000;
 
+// How long an aborted turn is given to stop gracefully before its process is
+// killed. `interrupt()` lets the CLI finish writing the turn it is abandoning —
+// skipping it can leave the turn's last tool call without its result row on
+// disk. It must never be able to hold the abort up, so the wait is bounded: a
+// runtime that stopped responding still gets stopped.
+const INTERRUPT_GRACE_MS = 3_000;
+
+// How long a session's running tasks are given to acknowledge a stop before the
+// process is closed out from under them. `stop_task` is a single control message,
+// so this only ever covers a CLI that has stopped reading its own channel — and a
+// CLI in that state is about to lose the process regardless.
+const TASK_STOP_GRACE_MS = 1_500;
+
+// How long a session's spawned tasks are given to end on their own after being asked
+// to stop, before the process they run in is closed out from under them.
+//
+// `stop_task` is a request, not a kill: the task decides when it is done and says so
+// with a `task_notification`. Closing the process before that notification arrives is
+// what cut agents off mid-step. This is the window in which they get to reach a
+// stopping point instead.
+//
+// It is a real trade, and it is also exactly how much slower "stop" feels, because the
+// process cannot be closed until the wait is over. Ten seconds is long enough for an
+// agent to wind down and short enough that the control still reads as a control. A task
+// that does not finish in here is stopped anyway — the close that follows takes it.
+// Override per call, or for a whole deployment with this env var.
+const SUBAGENT_STOP_GRACE_MS = (() => {
+  const configured = Number(process.env.CLAUDE_SUBAGENT_STOP_GRACE_MS);
+  return Number.isFinite(configured) && configured >= 0 ? configured : 10_000;
+})();
+
+// How often the wait above re-checks whether the tasks it is waiting on have ended.
+// They announce it by landing in the run loop, so this is a poll of a map that is
+// already being maintained rather than a subscription of its own.
+const TASK_SETTLE_POLL_MS = 200;
+
+// Whether to ask the CLI to emit a turn as it is written, instead of only once each
+// block is complete.
+//
+// Reasoning is what this is really for. Without it a thinking model emits nothing at
+// all for the length of its reasoning — the completed block is the first anyone hears
+// of it — so the client can only show a spinner while the most interesting part of the
+// turn happens. With it, both the answer and the reasoning arrive incrementally.
+//
+// It changes what the CLI puts on the wire, so it can be switched off (set this to
+// `0`) if a stream ever has to be quiet — for bandwidth, or if a CLI build turns out
+// to double-report completed blocks alongside the increments.
+const INCLUDE_PARTIAL_MESSAGES = process.env.CLAUDE_INCLUDE_PARTIAL_MESSAGES !== '0';
+
 // How long background work is allowed to keep running after a turn ends. This drives
 // two halves of the same behaviour:
 //
@@ -311,8 +360,10 @@ function mapCliOptionsToSDK(options = {}) {
  * @param {Object} queryInstance - SDK query instance
  * @param {Object} writer - WebSocket writer for reconnect support
  * @param {Function} releaseInput - Closes the held stdin stream so the CLI can exit
+ * @param {AbortController} abortController - Cancels the run, process included
+ * @param {Map} runningTasks - Tasks this run spawned and has not seen settle
  */
-function addSession(sessionId, queryInstance, writer = null, releaseInput = null) {
+function addSession(sessionId, queryInstance, writer = null, releaseInput = null, abortController = null, runningTasks = null) {
   const existing = activeSessions.get(sessionId);
   // A different live instance under the same key means an earlier run was
   // superseded without being stopped (e.g. an abort that raced run setup and
@@ -331,6 +382,18 @@ function addSession(sessionId, queryInstance, writer = null, releaseInput = null
       .catch((error) => {
         console.error(`Error interrupting superseded run for session ${sessionId}:`, error?.message || error);
       });
+    // The abandoned run is left behind for real: interrupting only ends its
+    // current turn, so whatever that turn backgrounded would otherwise keep
+    // running — and spending — for the rest of the ceiling.
+    //
+    // The tasks are asked to stop first, because the abort below closes the very
+    // channel that request travels over. It is not awaited: this path must not
+    // delay the run that is replacing it, and the requests are dispatched
+    // synchronously before the first await inside. Its tasks have no other owner
+    // either — the run that would have collected them is the one being replaced,
+    // and nothing downstream knows they exist.
+    void stopRunningTasks(existing, sessionId);
+    existing.abortController?.abort();
     existing.releaseInput?.();
   }
   const carried = superseding ? null : existing;
@@ -340,7 +403,13 @@ function addSession(sessionId, queryInstance, writer = null, releaseInput = null
     status: 'active',
     writer,
     // Re-registered mid-run once the provider session id lands; keep the closer.
-    releaseInput: releaseInput || carried?.releaseInput || null
+    releaseInput: releaseInput || carried?.releaseInput || null,
+    // The only handle that stops the CLI process rather than just the turn.
+    // Re-registered runs carry the one they were started with.
+    abortController: abortController || carried?.abortController || null,
+    // Shared by reference with the run loop that fills it, so re-registering a
+    // run must hand back the same map rather than start an empty one.
+    runningTasks: runningTasks || carried?.runningTasks || null
   });
 }
 
@@ -350,6 +419,20 @@ function addSession(sessionId, queryInstance, writer = null, releaseInput = null
  */
 function removeSession(sessionId) {
   activeSessions.delete(sessionId);
+}
+
+/**
+ * Registers a stand-in session so the abort path can be exercised without
+ * spawning a real CLI.
+ *
+ * Test-only. Real runs register themselves through `addSession`, and the entry
+ * installed here is removed by the abort under test, exactly as a live one is.
+ *
+ * @param {string} sessionId - Session identifier
+ * @param {Object} session - Session record to install
+ */
+export function registerActiveSessionForTests(sessionId, session) {
+  activeSessions.set(sessionId, session);
 }
 
 /**
@@ -586,6 +669,273 @@ export function startsBackgroundWork(sdkMessage) {
 }
 
 /**
+ * The `system` subtypes that open, amend, and close a spawned task.
+ */
+const TASK_EVENT_SUBTYPES = new Set(['task_started', 'task_progress', 'task_updated', 'task_notification']);
+
+/**
+ * The task statuses after which a task is no longer running.
+ */
+const TASK_TERMINAL_STATUSES = new Set(['completed', 'failed', 'killed', 'stopped']);
+
+/**
+ * Records a spawned task's lifecycle against the session that started it.
+ *
+ * A backgrounded agent is not a turn, so nothing else in the run loop notices it:
+ * by the time the client is told the run is over its tasks are still spending.
+ * Keeping a registry of them is what lets "stop this session" mean stop
+ * everything it started, rather than only the turn in front of the user.
+ *
+ * The tool call that spawned the task is kept beside it so a stop can be reported
+ * against the card the task belongs to. `task_updated` carries only a `task_id`,
+ * so it can amend a status but never supplies the spawning id — the one recorded
+ * at `task_started` is the one that lasts.
+ *
+ * Used by the providers module's tests, which pin the event handling directly:
+ * the alternative is driving a whole SDK run to observe whether a task was still
+ * in the registry, and the cost of getting this wrong is a stop that misses work
+ * which is still spending.
+ *
+ * @param {Map} runningTasks - Session-scoped task registry, task id to tool-use id
+ * @param {Object} sdkMessage - Raw SDK stream message
+ */
+export function trackRunningTasks(runningTasks, sdkMessage) {
+  if (sdkMessage?.type !== 'system' || !TASK_EVENT_SUBTYPES.has(sdkMessage.subtype)) {
+    return;
+  }
+
+  const taskId = sdkMessage.task_id;
+  if (typeof taskId !== 'string' || !taskId) {
+    return;
+  }
+
+  if (sdkMessage.subtype === 'task_started') {
+    runningTasks.set(taskId, typeof sdkMessage.tool_use_id === 'string' ? sdkMessage.tool_use_id : null);
+    return;
+  }
+
+  // A notification always closes its task; a patch only does when the status it
+  // carries is one a task cannot come back from. A `task_progress` carries no
+  // status at all, and must not be read as one.
+  const status = sdkMessage.subtype === 'task_updated'
+    ? sdkMessage.patch?.status
+    : sdkMessage.status;
+  if (sdkMessage.subtype === 'task_notification' || TASK_TERMINAL_STATUSES.has(status)) {
+    runningTasks.delete(taskId);
+  }
+}
+
+/**
+ * Reports one stopped task on the session's run stream.
+ *
+ * The CLI sends a `task_notification` saying `stopped` for a task it was asked to
+ * stop, but it cannot be relied on for this: in a bulk stop the process is closed
+ * moments later, and in a single stop the notification is several round trips away.
+ * Reporting the stop here means the client learns the outcome immediately, and
+ * learns it the same way on both paths. Reporting it twice is harmless — the two
+ * agree, and the client folds them into the same card.
+ *
+ * A task with no recorded tool call has no card to report against, so it is
+ * skipped rather than reported against nothing.
+ *
+ * @param {Object} session - Session record from the active sessions map
+ * @param {string} sessionId - Session identifier
+ * @param {string} taskId - Provider task id
+ * @param {string|null|undefined} toolUseId - Tool call that spawned the task
+ */
+function reportTaskStopped(session, sessionId, taskId, toolUseId) {
+  if (!toolUseId) {
+    return;
+  }
+
+  try {
+    session.writer?.send?.(createNormalizedMessage({
+      id: `${sessionId}_task_stopped_${taskId}`,
+      sessionId,
+      timestamp: new Date().toISOString(),
+      provider: 'claude',
+      kind: 'subagent_update',
+      toolId: toolUseId,
+      subagent: { id: taskId, status: 'stopped', toolUseId },
+    }));
+  } catch (error) {
+    // Reporting the stop is best-effort. The stop itself already happened.
+    console.warn(`Failed to report stopped task ${taskId} for session ${sessionId}:`, error?.message || error);
+  }
+}
+
+/**
+ * Sends one `stop_task` and reports whether the runtime accepted it.
+ *
+ * Bounded, because a control channel that has stopped answering must not leave a
+ * click hanging. Unlike the bulk stop, this answer is acted on: only an accepted
+ * request means the task is going, and the caller tells the user the outcome.
+ *
+ * @param {Object} instance - SDK query instance
+ * @param {string} taskId - Provider task id
+ * @returns {Promise<boolean>} True when the request was accepted
+ */
+async function requestTaskStop(instance, taskId) {
+  let timer = null;
+  try {
+    const accepted = await Promise.race([
+      Promise.resolve(instance.stopTask(taskId)).then(() => true, () => false),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve(false), TASK_STOP_GRACE_MS);
+      }),
+    ]);
+    return accepted === true;
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
+}
+
+/** Resolves after `ms`, so a long wait can be walked in slices. */
+function delay(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+/**
+ * Asks every task the session still has running to stop, and returns what it asked.
+ *
+ * This is the whole of what a runtime can do to a spawned task from the outside: a
+ * `stop_task` control message on the CLI's own channel. It is a signal, not a kill —
+ * the task ends itself in response and says so with a `task_notification`, which is
+ * why the caller has to wait for the answer rather than assume one. That wait is
+ * `settleAskedTasks`.
+ *
+ * Dispatched rather than awaited: the caller owns the question of how long the
+ * answers are worth waiting for, and on one path (a run being replaced) they are
+ * worth no wait at all. The messages have left this process by the time this returns,
+ * so a caller about to close that process can still call this first.
+ *
+ * @param {Object} session - Session record from the active sessions map
+ * @returns {Array} Task id / spawning tool call pairs that were asked to stop
+ */
+function requestTaskStops(session) {
+  const runningTasks = session?.runningTasks;
+  const instance = session?.instance;
+  if (!runningTasks || runningTasks.size === 0 || typeof instance?.stopTask !== 'function') {
+    return [];
+  }
+
+  const asked = Array.from(runningTasks.entries());
+  for (const [taskId] of asked) {
+    // Settled rather than trusted: a request that is refused or ignored changes
+    // nothing here, because whatever the task does with it, the caller of this path
+    // is about to take the process away.
+    void settleWithin(instance.stopTask(taskId), TASK_STOP_GRACE_MS);
+  }
+
+  return asked;
+}
+
+/**
+ * Waits for the tasks that were asked to stop to end on their own, then accounts for
+ * the ones that did not.
+ *
+ * This is the difference between signalling a task and stopping it. A task that
+ * settles inside the grace is reported by the CLI itself, through the same
+ * `task_notification` that takes it out of the registry — nothing is said about it
+ * here, because saying it twice is saying it worse. Only the tasks still running when
+ * the wait runs out are reported from here: they are about to lose the process that
+ * runs them, so they are stopped either way, and this is the last side left that can
+ * say so.
+ *
+ * Bounded, always: an agent that ignores the request must not be able to hold the stop
+ * up, and the caller is on a path where a process still has to be closed.
+ *
+ * @param {Object} session - Session record from the active sessions map
+ * @param {string} sessionId - Session identifier
+ * @param {Array} asked - Task id / tool call pairs that were asked to stop
+ * @param {number} gracePeriodMs - Longest to wait for them to end on their own
+ */
+async function settleAskedTasks(session, sessionId, asked, gracePeriodMs) {
+  const runningTasks = session?.runningTasks;
+  if (!asked?.length || !runningTasks) {
+    return;
+  }
+
+  const deadline = Date.now() + Math.max(0, gracePeriodMs);
+  while (Date.now() < deadline && asked.some(([taskId]) => runningTasks.has(taskId))) {
+    await delay(Math.min(TASK_SETTLE_POLL_MS, deadline - Date.now()));
+  }
+
+  for (const [taskId, toolUseId] of asked) {
+    if (!runningTasks.has(taskId)) {
+      continue;
+    }
+    reportTaskStopped(session, sessionId, taskId, toolUseId);
+    runningTasks.delete(taskId);
+  }
+}
+
+/**
+ * Stops the session's tasks and reports them, without waiting for them to end.
+ *
+ * For the path where the process is closed immediately afterwards: what the tasks do
+ * with the signal before then is moot, because the process they run in is going. A
+ * caller that can afford to let them wind down first waits instead, and passes a grace
+ * period to `settleAskedTasks`.
+ *
+ * @param {Object} session - Session record from the active sessions map
+ * @param {string} sessionId - Session identifier
+ * @returns {Promise<number>} How many tasks were asked to stop
+ */
+async function stopRunningTasks(session, sessionId) {
+  const asked = requestTaskStops(session);
+  await settleAskedTasks(session, sessionId, asked, 0);
+  return asked.length;
+}
+
+/**
+ * Stops one task the session is still running, named by the tool call it came from.
+ *
+ * Addressed by tool-use id rather than by task id because that is the only one the
+ * client ever holds: a task id appears only on the provider's own task events, while
+ * the card the user is looking at is keyed by the call that spawned the agent. The
+ * lookup is the session's own registry, which also scopes the request for free — a
+ * tool-use id belonging to some other session is simply not in it.
+ *
+ * Unlike the bulk stop, a failure is reported rather than swallowed. The process
+ * stays alive on this path, so a task that was not stopped is still running, and
+ * calling it stopped would be the same lie the stop exists to remove.
+ *
+ * @param {string} sessionId - Session identifier
+ * @param {string} toolUseId - Tool call that spawned the agent
+ * @returns {Promise<boolean>} True when the runtime accepted the stop
+ */
+async function abortClaudeSubagent(sessionId, toolUseId) {
+  const session = getSession(sessionId);
+  const runningTasks = session?.runningTasks;
+  const instance = session?.instance;
+  if (!toolUseId || !runningTasks || typeof instance?.stopTask !== 'function') {
+    return false;
+  }
+
+  const match = Array.from(runningTasks.entries()).find(([, id]) => id === toolUseId);
+  if (!match) {
+    return false;
+  }
+
+  const [taskId] = match;
+  if (!await requestTaskStop(instance, taskId)) {
+    return false;
+  }
+
+  // Dropped only once the stop was accepted: a refused request leaves the task
+  // running, and it has to stay reachable for a second attempt.
+  runningTasks.delete(taskId);
+  reportTaskStopped(session, sessionId, taskId, toolUseId);
+  console.log(`Stopped subagent ${taskId} for session ${sessionId}`);
+  return true;
+}
+
+/**
  * Builds the SDK user messages for one turn.
  *
  * Always returns SDKUserMessage records rather than a bare string: a string
@@ -740,6 +1090,12 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
   // Set when a turn starts background work, cleared when the next `result`
   // arrives — only turns with work still outstanding hold their process open.
   let backgroundWorkPending = false;
+  // Streaming increments seen this turn, reported when it ends. Counting them is how
+  // "the model produced no reasoning" is told apart from "the reasoning never reached
+  // us" — two states that otherwise look identical from the outside, and the second
+  // of which is a silent misreading of the wire format.
+  let textDeltaCount = 0;
+  let thinkingDeltaCount = 0;
   // True while the process is being held open for background work, so a later
   // `result` can be recognised as that work reporting back.
   let heldForBackgroundWork = false;
@@ -905,6 +1261,29 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
       return { behavior: 'deny', message: decision.message ?? 'User denied tool use' };
     };
 
+    // The handle this run is stopped by.
+    //
+    // Note what aborting it does and does not do: it closes the SDK's process
+    // transport, which ends the CLI's stdin and then escalates to a kill if the
+    // process is still alive — SIGTERM on POSIX after the SDK's ~2s grace
+    // window, and SIGKILL (TerminateProcess on Windows) a further 5s later. It
+    // is not instant, and `Query.close()` would reach the very same path. What
+    // matters is that the escalation is bounded: without closing the transport
+    // the CLI outlives the abort for the rest of BG_WAIT_CEILING_MS.
+    const abortController = new AbortController();
+    sdkOptions.abortController = abortController;
+
+    // Ask for the turn as it is written. Set on the run rather than in the option
+    // mapper because it describes how this run's stream is to be delivered, which is
+    // the same reason the controller above is here.
+    sdkOptions.includePartialMessages = INCLUDE_PARTIAL_MESSAGES;
+
+    // Every task this run spawns, so a stop can end all of them rather than only
+    // the turn in front of the user. The same map is carried through the
+    // re-registrations below, which is what keeps the session's copy and this
+    // loop's copy the same one.
+    const runningTasks = new Map();
+
     let heldPrompt = createHeldPromptStream(promptMessages);
     releasePromptStream = heldPrompt.release;
     try {
@@ -929,17 +1308,21 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
 
     // Track the query instance for abort capability
     if (sessionKey()) {
-      addSession(sessionKey(), queryInstance, ws, releasePromptStream);
+      addSession(sessionKey(), queryInstance, ws, releasePromptStream, abortController, runningTasks);
     }
 
     // Process streaming messages
     console.log('Starting async generator loop for session:', capturedSessionId || 'NEW');
     for await (const message of queryInstance) {
+      // Tracked before anything else can drop or transform the message: a task
+      // that opens here is what a later stop has to be able to find.
+      trackRunningTasks(runningTasks, message);
+
       // Capture session ID from first message
       if (message.session_id && !capturedSessionId) {
 
         capturedSessionId = message.session_id;
-        addSession(sessionKey(), queryInstance, ws, releasePromptStream);
+        addSession(sessionKey(), queryInstance, ws, releasePromptStream, abortController, runningTasks);
 
         // Set session ID on writer
         if (ws.setSessionId && typeof ws.setSessionId === 'function') {
@@ -966,6 +1349,18 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
         if (transformedMessage.parentToolUseId && !msg.parentToolUseId) {
           msg.parentToolUseId = transformedMessage.parentToolUseId;
         }
+        // The runtime, not the transcript, decides whether an agent can still be
+        // stopped: it is the only side that holds the task handle. Stamping it here
+        // is what keeps the client from drawing a control the runtime could not
+        // honour — a transcript-read agent that only *looks* running has no handle.
+        if (msg.kind === 'subagent_update' && msg.subagent?.id && runningTasks.has(msg.subagent.id)) {
+          msg.subagent.canInterrupt = true;
+        }
+        if (msg.kind === 'stream_delta') {
+          textDeltaCount += 1;
+        } else if (msg.kind === 'thinking_delta') {
+          thinkingDeltaCount += 1;
+        }
         if (isSubagentPromptEcho(msg)) {
           continue;
         }
@@ -989,6 +1384,15 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
       }
 
       if (message.type === 'result') {
+        // One line per turn: enough to tell whether partial events are arriving and
+        // whether reasoning is among them, without a client attached. A turn that
+        // answers in text but streams none of it is the failure this exists to catch.
+        console.log(
+          `[claude] turn stream for ${sid}: ${textDeltaCount} text increments, ${thinkingDeltaCount} reasoning increments`
+        );
+        textDeltaCount = 0;
+        thinkingDeltaCount = 0;
+
         // The turn is done as far as the client is concerned.
         const abortPending = sessionKey() ? abortedSessionIds.has(sessionKey()) : false;
         if (!turnCompleteSent && !abortPending) {
@@ -1114,12 +1518,50 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
 }
 
 /**
- * Aborts an active SDK session
+ * Waits for a promise, but never longer than `timeoutMs`.
+ *
+ * Used to bound the graceful half of an abort. The stop that follows it must not
+ * be able to hang just because the runtime it is stopping stopped responding,
+ * and a rejection here is not a failure — it is the signal to go straight to the
+ * hard stop.
+ *
+ * @param {Promise<unknown>} promise - Work to wait for
+ * @param {number} timeoutMs - Longest to wait
+ */
+function settleWithin(promise, timeoutMs) {
+  return Promise.race([
+    Promise.resolve(promise).catch((error) => {
+      console.warn('Graceful stop failed; continuing with the hard stop:', error?.message || error);
+    }),
+    // Deliberately not unref'd: this timer is the only thing that can settle the
+    // race when the work being waited on never does, and an unref'd timer is
+    // allowed to be skipped entirely once the loop has nothing else to do.
+    new Promise((resolve) => {
+      setTimeout(resolve, timeoutMs);
+    }),
+  ]);
+}
+
+/**
+ * Aborts an active SDK session.
+ *
+ * The order is deliberate, and it is the whole shape of a graceful stop: signal the
+ * session's spawned tasks, end the turn the user is watching, give those tasks the
+ * grace period to end on their own, and only then take the process away. Nothing
+ * before that last step kills anything — a task that answers the signal in time stops
+ * by its own choice, and the process close exists for whatever did not answer.
+ *
  * @param {string} sessionId - Session identifier
+ * @param {Object} [options] - Stop policy
+ * @param {number} [options.subagentStopGraceMs] - How long spawned tasks get to end on
+ *   their own before the process is closed. Defaults to SUBAGENT_STOP_GRACE_MS.
  * @returns {boolean} True if session was aborted, false if not found
  */
-async function abortClaudeSDKSession(sessionId) {
+async function abortClaudeSDKSession(sessionId, options = {}) {
   const session = getSession(sessionId);
+  const stopGraceMs = Number.isFinite(options?.subagentStopGraceMs)
+    ? Math.max(0, options.subagentStopGraceMs)
+    : SUBAGENT_STOP_GRACE_MS;
 
   if (!session) {
     console.log(`Session ${sessionId} not found`);
@@ -1129,22 +1571,63 @@ async function abortClaudeSDKSession(sessionId) {
   try {
     console.log(`Aborting SDK session: ${sessionId}`);
 
-    // Mark before interrupting so the run loop knows not to emit its own
-    // terminal complete (the abort handler sends the aborted one).
+    // Mark before stopping so the run loop knows not to emit its own terminal
+    // complete (the abort handler sends the aborted one).
     abortedSessionIds.add(sessionId);
 
-    // Call interrupt() on the query instance
-    await session.instance.interrupt();
+    // Signal what the session spawned before anything else. Those tasks outlive the
+    // turn, so ending the turn is not something they are told about on their own — and
+    // `stop_task` is a control request over the CLI's own channel, so it has to go out
+    // while that channel is still open.
+    //
+    // A signal, not a kill: the tasks end themselves, and the grace period below is
+    // where they get to.
+    const askedTasks = requestTaskStops(session);
+    if (askedTasks.length > 0) {
+      console.log(`Asked ${askedTasks.length} running task(s) to stop for session ${sessionId}`);
+    }
 
-    // Release the held stdin stream; without this the CLI stays up for the rest
-    // of the post-turn hold even though the user cancelled.
+    // Ask the turn to stop as well, so the CLI can finish writing the turn it is
+    // abandoning. Bounded, because nothing below may depend on it.
+    //
+    // Deliberately ahead of the task grace: the turn is what the user is watching, so
+    // it has to end now. The tasks are winding down behind it either way.
+    await settleWithin(session.instance.interrupt(), INTERRUPT_GRACE_MS);
+
+    // Now let the tasks end on their own, before the process is taken from them. This
+    // is the whole of "signal, then wait": a task that reaches a stopping point inside
+    // the grace reports itself and is never cut short, and the ones that do not are
+    // accounted for by `settleAskedTasks`.
+    await settleAskedTasks(session, sessionId, askedTasks, stopGraceMs);
+
+    // Hard stop: this is the difference between the UI saying "stopped" and the
+    // work actually being stopped.
+    //
+    // The signal above only reaches a task that is still there to receive it, and the
+    // grace only ends the ones that chose to end. Anything left over — a task that
+    // ignored its request, work that was never a task at all, a backgrounded shell —
+    // would otherwise keep running and spending for the rest of the CLI's post-turn
+    // ceiling, which is BG_WAIT_CEILING_MS (30 minutes) here, while the client has
+    // already been told the run is over.
+    //
+    // Aborting the controller closes the process transport, and that transport's own
+    // escalation then ends the CLI within a bounded few seconds — see the note where
+    // the controller is created. It is the last resort, not the mechanism.
+    // Synchronous, and it cannot throw.
+    session.abortController?.abort();
+
+    // Release the held stdin stream as a second exit path — a runtime that
+    // ignored the abort must not be able to sit on the hold timer.
     session.releaseInput?.();
 
-    // Update session status
-    session.status = 'aborted';
-
-    // Clean up session
-    removeSession(sessionId);
+    // Update session status and drop the entry, but only while it still belongs
+    // to the run being stopped. The awaits above give a queued message time to
+    // register the session's next run under the same key, and removing that one
+    // would strand it with no handle to abort it by.
+    if (getSession(sessionId)?.instance === session.instance) {
+      session.status = 'aborted';
+      removeSession(sessionId);
+    }
 
     return true;
   } catch (error) {
@@ -1162,7 +1645,9 @@ async function abortClaudeSDKSession(sessionId) {
  */
 function isClaudeSDKSessionActive(sessionId) {
   const session = getSession(sessionId);
-  return session && session.status === 'active';
+  // Coerced: an absent entry is not "active", and callers asking a yes/no
+  // question should not have to distinguish `false` from `undefined`.
+  return Boolean(session && session.status === 'active');
 }
 
 /**
@@ -1213,6 +1698,7 @@ function reconnectSessionWriter(sessionId, newRawWs) {
 export const claudeRuntime = {
   run: queryClaudeSDK,
   abort: abortClaudeSDKSession,
+  abortSubagent: abortClaudeSubagent,
   permissions: {
     resolve: resolveToolApproval,
     listPending: getPendingApprovalsForSession,
@@ -1223,6 +1709,7 @@ export const claudeRuntime = {
 export {
   queryClaudeSDK,
   abortClaudeSDKSession,
+  abortClaudeSubagent,
   isClaudeSDKSessionActive,
   getActiveClaudeSDKSessions,
   resolveToolApproval,

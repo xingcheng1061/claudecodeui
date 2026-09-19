@@ -53,6 +53,25 @@ const parseSessionId = (value: unknown): string => {
   return sessionId;
 };
 
+/**
+ * Agent ids are provider-native — Claude writes `agent-<id>.jsonl` on disk and reports the
+ * bare id — so this only bounds the shape. Whether an id names anything is the provider's
+ * answer to give, not the route's.
+ */
+const AGENT_ID_PATTERN = /^[a-zA-Z0-9._-]{1,120}$/;
+
+const parseAgentId = (value: unknown): string => {
+  const agentId = readPathParam(value, 'agentId').trim();
+  if (!AGENT_ID_PATTERN.test(agentId)) {
+    throw new AppError('Invalid agentId.', {
+      code: 'INVALID_AGENT_ID',
+      statusCode: 400,
+    });
+  }
+
+  return agentId;
+};
+
 const readOptionalQueryString = (value: unknown): string | undefined => {
   if (typeof value !== 'string') {
     return undefined;
@@ -844,6 +863,37 @@ router.get(
       limit,
       offset,
     });
+    res.json(createApiSuccessResponse(result));
+  }),
+);
+
+/**
+ * Every subagent this session spawned, however little of the transcript is loaded.
+ *
+ * Deliberately not a page of `/messages`: the panel that draws agents must not lose one
+ * because the row that spawned it fell outside the client's paging window.
+ */
+router.get(
+  '/sessions/:sessionId/subagents',
+  asyncHandler(async (req: Request, res: Response) => {
+    const sessionId = parseSessionId(req.params.sessionId);
+    const result = await sessionsService.listSessionSubagents(sessionId);
+    res.json(createApiSuccessResponse(result));
+  }),
+);
+
+/**
+ * One subagent's full activity timeline, fetched when a reader expands it.
+ *
+ * An empty timeline is a valid answer for a provider that keeps no per-agent transcript;
+ * the agent's summary and status come from `/subagents` either way.
+ */
+router.get(
+  '/sessions/:sessionId/subagents/:agentId/transcript',
+  asyncHandler(async (req: Request, res: Response) => {
+    const sessionId = parseSessionId(req.params.sessionId);
+    const agentId = parseAgentId(req.params.agentId);
+    const result = await sessionsService.fetchSubagentTranscript(sessionId, agentId);
     res.json(createApiSuccessResponse(result));
   }),
 );

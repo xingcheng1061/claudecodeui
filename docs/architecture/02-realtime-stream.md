@@ -36,7 +36,8 @@ it.
    dispatcher: gateway kinds and the two streaming kinds are handled specially, five
    kinds are control events that are deliberately *not* stored, and everything else —
    `text`, `tool_use`, `tool_result`, `thinking`, `error`, `task_notification` — just
-   becomes a row.
+   becomes a row. `subagent_update` is stored the same way and is then folded into the card
+   it names, which makes it the one stored kind that never becomes a row of its own.
 3. **A streaming reply is one row, not many.** `updateStreaming` writes a row with the id
    `__streaming_<sessionId>` and replaces it in place on every flush. The transcript's
    row count stays flat while the text grows. `finalizeStreaming` rewrites that same array
@@ -148,8 +149,9 @@ reload can make the transcript look completely different from what streamed.
 | Kind | Claude | Codex | Cursor | OpenCode |
 | --- | --- | --- | --- | --- |
 | `text` | yes, whole assistant messages | yes | history only | history only |
-| `stream_delta` | **no** | **no** | yes, one per assistant chunk | yes, from `text` parts |
-| `stream_end` | **no** | **no** | **never** | yes, from `step_finish` |
+| `stream_delta` | yes, from `content_block_delta` | **no** | yes, one per assistant chunk | yes, from `text` parts |
+| `thinking_delta` | yes, from `content_block_delta` | **no** | **no** | **no** |
+| `stream_end` | yes, one per `content_block_stop` | **no** | **never** | yes, from `step_finish` |
 | `thinking` | yes | yes | history only | yes, from `reasoning` parts |
 | `tool_use` | yes | yes | history only | yes |
 | `tool_result` | yes, a separate frame | yes, a separate frame | history only | **never** — attached to the `tool_use` frame instead |
@@ -160,14 +162,24 @@ reload can make the transcript look completely different from what streamed.
 
 Two entries deserve the emphasis:
 
-**Claude does not stream deltas today.** `claude-sessions.provider.ts:684` does contain a
-branch that turns `content_block_delta` into a `stream_delta`, which is why the opposite
-is widely believed. That branch is unreachable: `mapCliOptionsToSDK` in
-`claude-runtime.provider.js` builds its options object from scratch and never sets
-`includePartialMessages`, which the SDK defaults to false — and even with it enabled the
-SDK wraps partial events as `{ type: 'stream_event', event: … }`, a shape the branch does
-not match. What arrives live is one complete `text` row per assistant message, so a long
-Claude reply appears in whole paragraphs, not character by character.
+**Claude streams deltas — and streams its reasoning with them.** Both come from the same
+`content_block_delta` event: `delta.text` becomes a `stream_delta`, `delta.thinking` becomes a
+`thinking_delta`. They deliberately do not share a kind, because folding reasoning into the
+answer would draw the model's working as something it said, and the completed `thinking` block
+would then land as a second copy of it.
+
+This only happens because the runtime asks for it: `claude-runtime.provider.js:1279` sets
+`includePartialMessages`, on unless `CLAUDE_INCLUDE_PARTIAL_MESSAGES=0`. That flag is not a
+verbosity setting — with it off there are no deltas at all and a reply appears whole — and it is
+what makes reasoning visible *while it happens*, since a thinking model otherwise emits nothing
+until its reasoning is finished. `content_block_stop` closes the block as a `stream_end`, one per
+block, which is what finalises the row the deltas were accumulating into.
+
+One shape caveat, because getting it wrong fails silently: the CLI may send a partial event bare
+or wrapped in `{ type: 'stream_event', event: … }`, and which of the two arrives is the CLI's
+choice rather than this side's. `claude-sessions.provider.ts:841` reads both. Matching only one
+does not raise anything — it just stops the streaming, which is why `claude-stream-deltas.test.ts`
+pins both shapes.
 
 **Cursor emits `stream_delta` and never `stream_end`.** There is no `stream_end` anywhere
 under `list/cursor/`. On Cursor the streaming placeholder is only ever finalised by the

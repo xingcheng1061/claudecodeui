@@ -12,6 +12,8 @@ import type {
   NormalizedMessage,
   SubagentActivity,
   SubagentInfo,
+  SubagentStatus,
+  SubagentUsage,
 } from '@/shared/types.js';
 import { parseFilesInputTag } from '@/shared/image-attachments.js';
 import { prepareTranscriptMessages } from '@/shared/message-unification.js';
@@ -245,6 +247,134 @@ function readTaggedValue(content: string, tagName: string): string {
   return match ? match[1].trim() : '';
 }
 
+/** Reads a string field that may be absent, empty, or of some other type. */
+function readOptionalString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value : undefined;
+}
+
+/**
+ * The `system` subtypes that carry a spawned agent's lifecycle.
+ *
+ * `task_started` opens a task, `task_progress` amends it, and
+ * `task_notification` closes it. All three name the `tool_use_id` of the call
+ * that spawned the agent, which is what lets the client attach them to a row.
+ *
+ * `task_updated` is deliberately absent: it carries only the provider's own
+ * `task_id`, so accepting it would mean keeping a task-to-tool mapping alive on
+ * the server purely to translate an identifier. Its terminal outcomes arrive on
+ * `task_notification` anyway, and only its transient states are lost.
+ */
+const CLAUDE_TASK_EVENT_SUBTYPES = new Set([
+  'task_started',
+  'task_progress',
+  'task_notification',
+]);
+
+/**
+ * Maps one Claude task status onto the subagent lifecycle the UI draws.
+ *
+ * The task stream and the transcript name the same states differently, so
+ * `killed` and `stopped` both land on `stopped`, and a task that is owed but
+ * not yet started already reads as running. An unrecognized status returns
+ * `null` so the caller leaves the last known state in place rather than
+ * inventing a transition.
+ */
+function mapClaudeTaskStatus(status: unknown): SubagentStatus | null {
+  switch (status) {
+    case 'pending':
+    case 'running':
+      return 'running';
+    case 'completed':
+      return 'completed';
+    case 'failed':
+      return 'failed';
+    case 'killed':
+    case 'stopped':
+      return 'stopped';
+    default:
+      return null;
+  }
+}
+
+/**
+ * Reads the `{ total_tokens, tool_uses, duration_ms }` accounting Claude puts on
+ * task events.
+ *
+ * This is not the Anthropic usage shape, so it must never be read with the
+ * budget helpers — doing so produced an all-zero counter mid-run.
+ */
+function readClaudeTaskUsage(usage: unknown): SubagentUsage | undefined {
+  const record = readObjectRecord(usage);
+  if (!record) {
+    return undefined;
+  }
+
+  return {
+    totalTokens: Number(record.total_tokens ?? record.totalTokens) || 0,
+    toolUses: Number(record.tool_uses ?? record.toolUses) || 0,
+    durationMs: Number(record.duration_ms ?? record.durationMs) || 0,
+  };
+}
+
+/**
+ * Normalizes one live Claude task event into a subagent status update.
+ *
+ * The tool call that spawns an agent cannot describe a *backgrounded* one: its
+ * launch result returns as soon as the agent is admitted, so inferring status
+ * from whether that result arrived made a still-running agent render as
+ * finished. These events are the agent's real lifecycle, so the client is told
+ * about each transition instead of being left to guess at one.
+ *
+ * Returns `null` when the event names no tool call — a task the transcript has
+ * no row for, such as a backgrounded Bash command, has nothing to attach to —
+ * and when the reported status is one the UI cannot draw.
+ */
+function normalizeClaudeTaskEvent(
+  raw: AnyRecord,
+  sessionId: string | null,
+  id: string,
+  timestamp: string,
+): NormalizedMessage[] | null {
+  const subtype = typeof raw.subtype === 'string' ? raw.subtype : '';
+  if (!CLAUDE_TASK_EVENT_SUBTYPES.has(subtype)) {
+    return null;
+  }
+
+  const toolUseId = readOptionalString(raw.tool_use_id);
+  const taskId = readOptionalString(raw.task_id);
+  if (!toolUseId || !taskId) {
+    return null;
+  }
+
+  // Only a closing notification reports a status; the other two describe a
+  // task that is still going.
+  const status = mapClaudeTaskStatus(raw.status ?? 'running');
+  if (!status) {
+    return null;
+  }
+
+  const subagent: SubagentInfo = {
+    // The task id, not the transcript's `agentId`: this path has not read the
+    // agent's transcript yet, and the two are only reconciled once history does.
+    id: taskId,
+    status,
+    toolUseId,
+    type: readOptionalString(raw.subagent_type),
+    description: readOptionalString(raw.description),
+    usage: readClaudeTaskUsage(raw.usage),
+  };
+
+  return [createNormalizedMessage({
+    id: `${id}_${subtype}_${taskId}`,
+    sessionId,
+    timestamp,
+    provider: PROVIDER,
+    kind: 'subagent_update',
+    toolId: toolUseId,
+    subagent,
+  })];
+}
+
 /**
  * Collects every `<task-notification>` turn keyed by the tool call that
  * spawned the agent it reports on.
@@ -452,24 +582,31 @@ async function getSessionMessages(
 
     // Read each spawned agent's own transcript once, then hang it off every
     // row that references it.
+    //
+    // A transcript that cannot be located is not a reason to drop the agent:
+    // the spawn is still recorded in this transcript, and a card with its type
+    // and description but an empty timeline is far more use than the plain tool
+    // call it would otherwise collapse back into. `transcriptFound` keeps that
+    // distinction explicit, because the status inference below depends on
+    // knowing whether an unfinished timeline means anything.
     const subagentsById = new Map<string, {
       activity: SubagentActivity[];
       info: SubagentInfo;
       endedMidToolCall: boolean;
+      transcriptFound: boolean;
     }>();
     for (const agentId of agentIds) {
       const located = await findClaudeSubagentTranscript(projectDir, providerSessionId, agentId);
-      if (!located) {
-        continue;
-      }
-
-      const [transcript, meta] = await Promise.all([
-        readClaudeSubagentTranscript(located.transcriptPath),
-        readClaudeSubagentMeta(located.metaPath),
-      ]);
+      const [transcript, meta] = located
+        ? await Promise.all([
+          readClaudeSubagentTranscript(located.transcriptPath),
+          readClaudeSubagentMeta(located.metaPath),
+        ])
+        : [{ activity: [] as SubagentActivity[], endedMidToolCall: false }, {} as ClaudeSubagentMeta];
 
       subagentsById.set(agentId, {
         endedMidToolCall: transcript.endedMidToolCall,
+        transcriptFound: Boolean(located),
         activity: transcript.activity
           .slice(0, MAX_TRANSMITTED_SUBAGENT_ACTIVITIES)
           .map(truncateSubagentActivity),
@@ -505,10 +642,21 @@ async function getSessionMessages(
       // An async agent's launch row never tells you it finished — only the
       // later notification does. When that notification is missing (a live run,
       // or one compacted out of the transcript), the agent's own transcript is
-      // the evidence: a timeline that does not stop mid-tool-call is done.
+      // the evidence: a timeline that does not stop mid-tool-call is done. An
+      // unreadable transcript is evidence of nothing, so the agent stays
+      // running rather than being declared finished on no information.
       const isAwaitingAsyncAgent = message.toolUseResult?.isAsync === true
         && !notification
-        && (!subagent || subagent.endedMidToolCall);
+        && (!subagent?.transcriptFound || subagent.endedMidToolCall);
+      // A notification is terminal by definition, and a cancellation is not a
+      // failure: reading every non-completed status as one made a stopped agent
+      // render as broken. Both statuses the UI can draw are kept, and anything
+      // unrecognized falls back to completed so a finished agent cannot spin
+      // forever.
+      const reportedStatus = notification ? mapClaudeTaskStatus(notification.status) : null;
+      const terminalStatus = reportedStatus === 'failed' || reportedStatus === 'stopped'
+        ? reportedStatus
+        : 'completed';
 
       if (subagent) {
         if (subagent.activity.length > 0) {
@@ -516,15 +664,12 @@ async function getSessionMessages(
         }
         message.subagent = {
           ...subagent.info,
+          toolUseId: toolUseId ?? undefined,
           description: subagent.info.description
             ?? (typeof message.toolUseResult?.description === 'string' ? message.toolUseResult.description : undefined),
           model: subagent.info.model
             ?? (typeof message.toolUseResult?.resolvedModel === 'string' ? message.toolUseResult.resolvedModel : undefined),
-          status: isAwaitingAsyncAgent
-            ? 'running'
-            : notification && notification.status !== 'completed'
-              ? 'failed'
-              : 'completed',
+          status: isAwaitingAsyncAgent ? 'running' : terminalStatus,
         };
       }
 
@@ -688,10 +833,28 @@ export class ClaudeSessionsProvider implements IProviderSessions {
       return [];
     }
 
-    if (raw.type === 'content_block_delta' && raw.delta?.text) {
-      return [createNormalizedMessage({ kind: 'stream_delta', content: raw.delta.text, sessionId, provider: PROVIDER })];
+    // Partial events, when the runtime asks the CLI for them. Each one is either a
+    // bare raw event or one wrapped in a `stream_event` envelope — which of the two
+    // arrives is the CLI's choice, not this side's, so both are read. Guessing wrong
+    // does not fail loudly: it just stops streaming, which is the one symptom nobody
+    // can see from a test that only exercises one shape.
+    const streamEvent = raw.type === 'stream_event' ? readObjectRecord(raw.event) : raw;
+    if (streamEvent?.type === 'content_block_delta') {
+      const delta = readObjectRecord(streamEvent.delta);
+      if (typeof delta?.text === 'string') {
+        return [createNormalizedMessage({ kind: 'stream_delta', content: delta.text, sessionId, provider: PROVIDER })];
+      }
+      // Reasoning is a separate stream from the answer, and is kept separate here.
+      // Sharing `stream_delta` would append thinking to the answer as it is written,
+      // and the completed thinking block would then arrive as a second copy of it.
+      if (typeof delta?.thinking === 'string') {
+        return [createNormalizedMessage({ kind: 'thinking_delta', content: delta.thinking, sessionId, provider: PROVIDER })];
+      }
+      // Anything else is a stream this side has no row for — tool arguments arrive
+      // as `input_json_delta`, and the call itself is reported separately.
+      return [];
     }
-    if (raw.type === 'content_block_stop') {
+    if (streamEvent?.type === 'content_block_stop') {
       return [createNormalizedMessage({ kind: 'stream_end', sessionId, provider: PROVIDER })];
     }
 
@@ -758,6 +921,16 @@ export class ClaudeSessionsProvider implements IProviderSessions {
       }
 
       return [];
+    }
+
+    // A spawned agent's live lifecycle. Nothing else in the stream reports it:
+    // the JSONL transcript only records the agent's finished sidechain, and the
+    // spawning tool call returns long before a backgrounded agent is done.
+    if (raw.type === 'system') {
+      const taskUpdate = normalizeClaudeTaskEvent(raw, sessionId, baseId, ts);
+      if (taskUpdate) {
+        return taskUpdate;
+      }
     }
 
     if (raw.message?.role === 'user' && raw.message?.content && raw.isMeta !== true) {
@@ -1173,5 +1346,40 @@ export class ClaudeSessionsProvider implements IProviderSessions {
       // whatever it was when the session was opened.
       tokenUsage: summarizeClaudeTokenUsage(rawMessages),
     };
+  }
+
+  /**
+   * One spawned agent's transcript, read on demand and uncapped.
+   *
+   * `getSessionMessages` already reads every agent's transcript, but it caps what it hangs
+   * off the parent's rows — `MAX_TRANSMITTED_SUBAGENT_ACTIVITIES` entries, each truncated —
+   * because those rows travel with every history page. A reader asking to see one agent in
+   * full is asking for the file, so this reads it again rather than serving the capped copy.
+   */
+  async fetchSubagentTranscript(
+    sessionId: string,
+    agentId: string,
+    options: FetchHistoryOptions = {},
+  ): Promise<SubagentActivity[] | null> {
+    const session = sessionsDb.getSessionById(sessionId);
+    const jsonLPath = session?.jsonl_path;
+    const providerSessionId = options.providerSessionId ?? session?.provider_session_id;
+    if (!jsonLPath || !providerSessionId || !agentId) {
+      return null;
+    }
+
+    // Resolved the same way `getSessionMessages` resolves it, from the parent transcript's
+    // own directory, so both agree on where an agent lives.
+    const located = await findClaudeSubagentTranscript(
+      path.dirname(jsonLPath),
+      providerSessionId,
+      agentId,
+    );
+    if (!located) {
+      return null;
+    }
+
+    const transcript = await readClaudeSubagentTranscript(located.transcriptPath);
+    return transcript.activity;
   }
 }

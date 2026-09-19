@@ -374,6 +374,13 @@ export const api = {
       pagination: { limit?: number | null; offset?: number } = {},
       options: ApiRequestOptions = {},
     ) => get(sessionMessagesUrl(sessionId, pagination), options),
+    // Every subagent the session spawned, read from the whole transcript rather than from
+    // the messages the client has loaded. The panel above the composer is what uses it.
+    sessionSubagents: (sessionId: string) =>
+      get(`/api/providers/sessions/${encodeURIComponent(sessionId)}/subagents`),
+    // One agent's full activity timeline, fetched when a reader opens it in that panel.
+    sessionSubagentTranscript: (sessionId: string, agentId: string) =>
+      get(`/api/providers/sessions/${encodeURIComponent(sessionId)}/subagents/${encodeURIComponent(agentId)}/transcript`),
     sessionTokenUsage: (sessionId: string) =>
       get(`/api/providers/sessions/${encodeURIComponent(sessionId)}/token-usage`),
     sessionActiveModel: (provider: string, sessionId: string) =>

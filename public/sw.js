@@ -36,7 +36,9 @@ self.addEventListener('fetch', event => {
     return;
   }
 
-  // Hashed assets (JS/CSS in /assets/) — cache-first since filenames change per build
+  // Hashed assets (JS/CSS in /assets/) — cache-first since filenames change per build.
+  // The same rule as below applies on a miss with the network down: answer with a
+  // Response rather than letting the request reject opaquely.
   if (url.includes('/assets/')) {
     event.respondWith(
       caches.match(event.request).then(cached => {
@@ -45,15 +47,31 @@ self.addEventListener('fetch', event => {
           const clone = response.clone();
           caches.open(CACHE_NAME).then(cache => cache.put(event.request, clone));
           return response;
-        });
+        }).catch(() => new Response('', {
+          status: 504,
+          statusText: 'Gateway Timeout',
+          headers: { 'Content-Type': 'text/plain' }
+        }));
       })
     );
     return;
   }
 
-  // Everything else — network-first
+  // Everything else — network-first.
+  //
+  // The `|| new Response(…)` is not decoration. `caches.match` resolves to `undefined`
+  // on a miss, and `respondWith(undefined)` rejects: the browser reports it as "Failed to
+  // convert value to 'Response'" and hands the page a network error instead. Every
+  // request that reached this line while the server was briefly unreachable — a restart,
+  // a rebuild — failed that way.
   event.respondWith(
-    fetch(event.request).catch(() => caches.match(event.request))
+    fetch(event.request).catch(() =>
+      caches.match(event.request).then(cached => cached || new Response('', {
+        status: 504,
+        statusText: 'Gateway Timeout',
+        headers: { 'Content-Type': 'text/plain' }
+      }))
+    )
   );
 });
 

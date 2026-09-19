@@ -91,6 +91,23 @@ export function createProviderRuntimeService(
       return Boolean(await dependencies.resolveProvider(providerName).runtime.abort(sessionId));
     },
 
+    async abortSubagent(sessionId: string, toolUseId: string): Promise<boolean> {
+      // Asked of every provider rather than resolved from a run, because the agents
+      // this targets are the ones that outlive their turn: by the time the user
+      // reaches for the control, the run that spawned them has usually already
+      // reported complete and can no longer name their provider. Only the runtime
+      // that holds the task answers true, and each answers from its own registry,
+      // so a tool call belonging to another session simply matches nothing.
+      for (const provider of dependencies.listProviders()) {
+        const stopSubagent = provider.runtime.abortSubagent;
+        if (typeof stopSubagent === 'function'
+          && await stopSubagent.call(provider.runtime, sessionId, toolUseId)) {
+          return true;
+        }
+      }
+      return false;
+    },
+
     resolveToolApproval(requestId: string, decision: ProviderPermissionDecision): void {
       for (const provider of dependencies.listProviders()) {
         provider.runtime.permissions?.resolve(requestId, decision);

@@ -1,5 +1,5 @@
 import { useTranslation } from 'react-i18next';
-import { memo, useCallback, useMemo } from 'react';
+import { memo, useCallback, useEffect, useMemo } from 'react';
 import type { Dispatch, RefObject, SetStateAction } from 'react';
 
 import type { ChatMessage,
@@ -11,6 +11,7 @@ import type { ChatMessage,
 import { getIntrinsicMessageKey } from '@/modules/chat/utils/messageKeys';
 import { groupConsecutiveTools, isToolGroupItem } from '@/modules/chat/utils/toolGrouping';
 import { useLazyRowObserver } from '@/modules/chat/hooks/useLazyRowObserver';
+import { useSubagentFocus } from '@/modules/chat/context/SubagentFocusContext';
 import LazyMessageRow from '@/modules/chat/transcript/LazyMessageRow';
 import MessageComponent from '@/modules/chat/transcript/MessageComponent';
 import ProviderSelectionEmptyState from '@/modules/chat/transcript/ProviderSelectionEmptyState';
@@ -164,6 +165,40 @@ function ChatMessagesPane({
       messageKeyMap.get(message) ?? getIntrinsicMessageKey(message) ?? 'message-generated',
     [messageKeyMap],
   );
+
+  // A focused subagent's card may sit in a row whose content is not mounted — the lazy-row
+  // band only covers the viewport's neighbourhood, and a long transcript puts most cards
+  // outside it, where the card's own scrollIntoView would find no element at all. The row's
+  // wrapper, though, always exists, so scrolling there mounts the content, and the card's
+  // own focus effect then centres it.
+  const subagentFocus = useSubagentFocus();
+  const focusedSubagentToolUseId = subagentFocus?.focusedToolUseId ?? null;
+  const subagentFocusToken = subagentFocus?.focusToken ?? 0;
+  useEffect(() => {
+    if (!focusedSubagentToolUseId) {
+      return;
+    }
+    const container = scrollContainerRef.current;
+    if (!container) {
+      return;
+    }
+
+    const containerRow = groupedVisibleMessages.find((item) => {
+      const message = isToolGroupItem(item) ? item.messages[0] : item;
+      return message.subagent?.toolUseId === focusedSubagentToolUseId
+        || message.toolId === focusedSubagentToolUseId;
+    });
+    const rowMessage = containerRow
+      ? (isToolGroupItem(containerRow) ? containerRow.messages[0] : containerRow)
+      : null;
+    if (!rowMessage?.timestamp) {
+      return;
+    }
+
+    container
+      .querySelector(`[data-message-timestamp="${rowMessage.timestamp}"]`)
+      ?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  }, [focusedSubagentToolUseId, subagentFocusToken, groupedVisibleMessages, scrollContainerRef]);
 
   return (
     <div

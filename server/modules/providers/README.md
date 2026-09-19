@@ -91,6 +91,32 @@ import the service from `server/modules/providers/index.ts`.
 - `sessions` handles runtime event normalization and history fetches.
 - `sessionSynchronizer` handles file-backed session indexing into `sessionsDb`.
 
+## What `abort` must guarantee
+
+`abort(sessionId)` means "this run is over", not merely "the current turn is
+over". A turn that backgrounded work — a spawned subagent, a backgrounded shell —
+outlives its own `result`, so a stop that only interrupts the turn leaves that
+work running and spending while the client has already been told the run
+finished. Implementations must therefore terminate the underlying process and not
+settle for the turn-level signal:
+
+- **Claude** creates an `AbortController` per run, hands it to the SDK as
+  `options.abortController`, keeps it on the session record, and aborts it. What
+  that buys is not an instant kill but a *bounded* one: aborting closes the SDK's
+  process transport, which ends the CLI's stdin and then escalates — `SIGTERM`
+  after the SDK's ~2 s grace window on POSIX, and a `SIGKILL`
+  (`TerminateProcess` on Windows) five seconds after that. `Query.close()`
+  reaches the same transport path, so it is an equivalent alternative rather than
+  a different mechanism; do not claim either is immediate.
+- **Codex** aborts the controller its streamed turn was started with.
+
+The turn is still asked to stop gracefully first, under a bounded wait, so the
+CLI can finish writing the turn it is abandoning; the hard stop must never depend
+on that wait completing, and a rejection from the graceful half is not a failure.
+
+A run abandoned by a newer one for the same session is stopped the same way, for
+the same reason.
+
 ## How To Add A Provider
 
 1. Add the provider id everywhere it is part of the contract.
@@ -176,6 +202,13 @@ Command forms currently used by the providers are:
 
 - Implement `normalizeMessage(raw, sessionId)` and `fetchHistory(sessionId, options)`.
 - Use `createNormalizedMessage(...)` and `generateMessageId(...)` for emitted messages.
+- If the provider reports a spawned agent's lifecycle on its event stream, normalize it to
+  `kind: 'subagent_update'` carrying the spawning `tool_use_id` and a `SubagentInfo`, and
+  ask the runtime to attach `subagent`/`subagentTools` to that tool call when reading
+  history. A tool call cannot describe a backgrounded agent on its own — its result returns
+  as soon as the agent is admitted — so without this the UI reports such an agent as
+  finished while it is still running. `claude-sessions.provider.ts` is the reference
+  implementation.
 - Keep normalized message ids unique. If one raw event produces multiple text
   parts, append a discriminator so ids do not collide.
 - Keep pagination consistent:

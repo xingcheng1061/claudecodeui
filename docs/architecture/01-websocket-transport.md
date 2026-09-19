@@ -256,7 +256,7 @@ in `server/shared/types.ts`.**
 **`MessageKind` (`:178-193`) — produced by provider runtimes:** `text`, `tool_use`,
 `tool_result`, `thinking`, `stream_delta`, `stream_end`, `error`, `complete`, `status`,
 `permission_request`, `permission_resolved`, `permission_cancelled`, `session_created`,
-`history_truncated`, `task_notification`.
+`history_truncated`, `task_notification`, `subagent_update`.
 
 **`GatewayEventKind` (`:204-208`) — produced by the gateway, no provider involved:**
 `chat_subscribed`, `session_upserted`, `loading_progress`, `protocol_error`.
@@ -276,7 +276,7 @@ Two kinds in those unions never appear where you would look for them:
 
 | Kind | Origin | Consumed by |
 | --- | --- | --- |
-| `text`, `thinking`, `tool_use`, `tool_result`, `task_notification` | Provider runtime | `useChatRealtimeHandlers` → session store (`:224-233`) |
+| `text`, `thinking`, `tool_use`, `tool_result`, `task_notification`, `subagent_update` | Provider runtime | `useChatRealtimeHandlers` → session store (`:224-233`) |
 | `stream_delta`, `stream_end` | Provider runtime | `useChatRealtimeHandlers`, flushed on a 100 ms timer (`:189-221`) |
 | `status` | Provider runtime | Activity indicator; `text === 'token_budget'` updates the context counter, and only for the viewed session (`:329-343`) |
 | `error` | Provider runtime | A message row. **Not** terminal |

@@ -180,6 +180,7 @@ export type MessageKind =
   | 'tool_use'
   | 'tool_result'
   | 'thinking'
+  | 'thinking_delta'
   | 'stream_delta'
   | 'stream_end'
   | 'error'
@@ -190,7 +191,8 @@ export type MessageKind =
   | 'permission_cancelled'
   | 'session_created'
   | 'history_truncated'
-  | 'task_notification';
+  | 'task_notification'
+  | 'subagent_update';
 
 /**
  * Event kinds added by the chat gateway layer on top of provider message kinds.
@@ -394,13 +396,42 @@ export type SubagentActivity = {
 };
 
 /**
+ * Lifecycle state of one subagent.
+ *
+ * `running` is live; the other three are terminal. `stopped` is deliberately
+ * distinct from `failed`: a cancellation is not an error, and reading it as one
+ * made cancelled agents look broken.
+ */
+export type SubagentStatus = 'running' | 'completed' | 'failed' | 'stopped';
+
+/**
+ * Token and tool accounting for one subagent, as the provider's task stream
+ * reports it.
+ *
+ * Claude sends this shape on `task_progress` and on the closing
+ * `task_notification`, so it is a running total rather than a delta — the last
+ * value received is the agent's whole cost.
+ */
+export type SubagentUsage = {
+  /** Tokens the agent spent, across every request it made. */
+  totalTokens: number;
+  /** Tool calls the agent made. */
+  toolUses: number;
+  /** Wall-clock milliseconds the agent has been running. */
+  durationMs: number;
+};
+
+/**
  * Identity and lifecycle of one spawned subagent, normalized across providers.
  *
- * `status` is `running` until the call that spawned the agent resolves. After
- * that it is whatever the provider reported — Claude's task notification
- * carries one — and `completed` when the provider reported nothing. A failed
- * tool call *inside* the agent is not a failed agent, so it is never inferred
- * from the transcript.
+ * `status` reflects the provider's own task lifecycle whenever it reports one:
+ * Claude drives it from `task_started` / `task_updated` / `task_notification`,
+ * so an agent that was cancelled reads `stopped` rather than being mistaken for
+ * a failure or a success. Providers with no task stream (Codex) leave the
+ * status to be inferred from whether the spawning call has resolved.
+ *
+ * A failed tool call *inside* the agent is not a failed agent, so a failure is
+ * never inferred from the transcript.
  */
 export type SubagentInfo = {
   /** Provider-native agent id — Claude `agentId`, Codex `agent_thread_id`. */
@@ -411,7 +442,7 @@ export type SubagentInfo = {
   type?: string;
   /** One-line task summary shown in the collapsed header. */
   description?: string;
-  status: 'running' | 'completed' | 'failed';
+  status: SubagentStatus;
   /** Model the subagent ran on, when the provider records it. */
   model?: string;
   /**
@@ -420,6 +451,21 @@ export type SubagentInfo = {
    * lets the UI say so instead of silently showing a partial timeline.
    */
   activityCount?: number;
+  /**
+   * The `tool_use` block that spawned this agent. It is how a live status
+   * update finds the transcript row it belongs to, and how the subagent list
+   * scrolls back to that row.
+   */
+  toolUseId?: string;
+  /**
+   * Whether the runtime is still holding a handle for this agent, and so can stop
+   * it on its own. Set by the runtime, never inferred by the UI: an agent that only
+   * *reads* as running — its status came from the transcript — cannot be addressed,
+   * and offering a control for it would fail the moment it was used.
+   */
+  canInterrupt?: boolean;
+  /** Running token/tool totals, when the provider reports them. */
+  usage?: SubagentUsage;
 };
 
 /**

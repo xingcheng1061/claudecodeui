@@ -1,15 +1,31 @@
-import { memo, useMemo, useState } from 'react';
-import { Bot, Brain, ChevronRight, CircleAlert, CircleCheck, MessageSquareText } from 'lucide-react';
+import { memo, useEffect, useMemo, useRef, useState } from 'react';
+import { Bot, Brain, ChevronRight, MessageSquareText } from 'lucide-react';
 
-import type { DiffLine, Project, SubagentActivity, SubagentInfo, ToolResult } from '@/shared/types';
+import type {
+  DiffLine,
+  Project,
+  SubagentActivity,
+  SubagentInfo,
+  SubagentStatus,
+  ToolResult,
+} from '@/shared/types';
 import { cn } from '@/shared/utils';
 import { ToolRenderer } from '@/modules/chat/tools/ToolRenderer';
 import { useIsExportingTranscript } from '@/modules/chat/context/TranscriptRenderContext';
+import { useSubagentFocus } from '@/modules/chat/context/SubagentFocusContext';
+import {
+  SUBAGENT_STATUS_PRESENTATION,
+  isSubagentActive,
+  resolveSubagentStatus,
+} from '@/modules/chat/subagents/subagentStatus';
+import { formatSubagentUsageLabel } from '@/modules/chat/utils/chatFormatting';
 import { MarkdownContent } from '@/modules/chat/tools/ContentRenderers/MarkdownContent';
 
 type SubagentPanelProps = {
   /** Raw tool input of the call that spawned the agent, used for the prompt. */
   toolInput: unknown;
+  /** The tool call that spawned the agent, used to recognise a focus request from the subagent list. */
+  toolUseId?: string;
   toolResult?: ToolResult | null;
   subagent?: SubagentInfo;
   activity?: SubagentActivity[];
@@ -61,12 +77,6 @@ function readResultText(content: unknown): string {
   return text;
 }
 
-const STATUS_STYLES: Record<SubagentInfo['status'], string> = {
-  running: 'text-purple-600 dark:text-purple-300',
-  completed: 'text-muted-foreground',
-  failed: 'text-red-600 dark:text-red-400',
-};
-
 /** One prose or reasoning entry from the agent's own narration. */
 const SubagentNote = memo(({ activity }: { activity: SubagentActivity }) => {
   const isThinking = activity.kind === 'thinking';
@@ -99,6 +109,7 @@ SubagentNote.displayName = 'SubagentNote';
  */
 export const SubagentPanel = memo(({
   toolInput,
+  toolUseId,
   toolResult,
   subagent,
   activity,
@@ -110,17 +121,36 @@ export const SubagentPanel = memo(({
   // only wanted on demand.
   const isExporting = useIsExportingTranscript();
   const [isOpen, setIsOpen] = useState(false);
-  const showTimeline = isOpen || isExporting;
+  // The subagent list asked for this card specifically. Expanding it is not
+  // enough on its own — the reader came here to look at this agent, so the card
+  // also has to be brought into view.
+  const focus = useSubagentFocus();
+  const isFocused = Boolean(toolUseId) && focus?.focusedToolUseId === toolUseId;
+  const cardRef = useRef<HTMLDivElement | null>(null);
+  const showTimeline = isOpen || isExporting || isFocused;
   // Raised by the "show more" step so a long run can be inspected in full
   // without paying for it up front.
   const [renderLimit, setRenderLimit] = useState(INITIALLY_RENDERED_ACTIVITIES);
   const effectiveRenderLimit = isExporting ? Number.POSITIVE_INFINITY : renderLimit;
 
+  // Keyed on the focus token rather than on `isFocused`: asking again for the agent that is
+  // already focused has to bring it back into view too — that is exactly the "the card is
+  // collapsed, I click the list again" case, where `isFocused` never lapsed and an id-keyed
+  // effect would sit still.
+  const focusToken = focus?.focusToken ?? 0;
+  useEffect(() => {
+    if (focusToken > 0 && isFocused) {
+      cardRef.current?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    }
+  }, [focusToken, isFocused]);
+
   const parsedInput = useMemo(() => parseToolInput(toolInput), [toolInput]);
   const resultText = useMemo(() => readResultText(toolResult?.content), [toolResult?.content]);
 
   const entries = activity ?? [];
-  const status = subagent?.status ?? (toolResult ? 'completed' : 'running');
+  const status: SubagentStatus = resolveSubagentStatus(subagent?.status, toolResult);
+  const active = isSubagentActive(status);
+  const presentation = SUBAGENT_STATUS_PRESENTATION[status];
   const toolCount = entries.filter((entry) => entry.kind === 'tool').length;
   // Claude names its agent presets (Explore, Plan); Codex has none, so the
   // neutral label carries and the assigned nickname shows alongside it.
@@ -135,14 +165,24 @@ export const SubagentPanel = memo(({
   const hiddenCount = entries.length - visibleEntries.length;
 
   return (
-    <div className="my-1 border-l-2 border-l-purple-500 py-0.5 pl-3 dark:border-l-purple-400">
+    <div
+      ref={cardRef}
+      className="my-1 border-l-2 border-l-purple-500 py-0.5 pl-3 dark:border-l-purple-400"
+    >
       <button
         type="button"
-        aria-expanded={isOpen}
-        onClick={() => setIsOpen((previous) => !previous)}
+        aria-expanded={showTimeline}
+        onClick={() => {
+          // A card the subagent list forced open is not the reader's own state,
+          // so the first click has to take that back before it can collapse.
+          if (isFocused) {
+            focus?.focusSubagent(null);
+          }
+          setIsOpen((previous) => !previous);
+        }}
         className="flex w-full select-none items-center gap-1.5 py-0.5 text-left text-xs text-muted-foreground transition-colors hover:text-foreground"
       >
-        <ChevronRight className={cn('h-3 w-3 flex-shrink-0 transition-transform duration-150', isOpen && 'rotate-90')} />
+        <ChevronRight className={cn('h-3 w-3 flex-shrink-0 transition-transform duration-150', showTimeline && 'rotate-90')} />
         <Bot className="h-3.5 w-3.5 flex-shrink-0 text-purple-500 dark:text-purple-400" />
         <span className="flex-shrink-0 font-medium text-foreground">{label || 'Agent'}</span>
         {description && (
@@ -154,23 +194,15 @@ export const SubagentPanel = memo(({
         {nickname && (
           <span className="flex-shrink-0 rounded bg-muted px-1 text-[10px] text-muted-foreground/70">{nickname}</span>
         )}
-        <span className={cn('ml-auto flex flex-shrink-0 items-center gap-1 text-[11px]', STATUS_STYLES[status])}>
-          {status === 'running' ? (
-            <>
-              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-purple-500 dark:bg-purple-400" />
-              running
-            </>
-          ) : status === 'failed' ? (
-            <>
-              <CircleAlert className="h-3 w-3" />
-              failed
-            </>
+        <span className={cn('ml-auto flex flex-shrink-0 items-center gap-1 text-[11px]', presentation.className)}>
+          {active ? (
+            <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-purple-500 dark:bg-purple-400" />
           ) : (
-            <>
-              <CircleCheck className="h-3 w-3" />
-              {toolCount > 0 ? `${toolCount} ${toolCount === 1 ? 'tool' : 'tools'}` : 'done'}
-            </>
+            <presentation.Icon className="h-3 w-3" />
           )}
+          {status === 'completed' && toolCount > 0
+            ? `${toolCount} ${toolCount === 1 ? 'tool' : 'tools'}`
+            : presentation.label}
         </span>
       </button>
 
@@ -178,6 +210,12 @@ export const SubagentPanel = memo(({
         <div className="mt-1.5 space-y-2 pl-[18px]">
           {subagent?.model && (
             <div className="text-[10px] uppercase tracking-wide text-muted-foreground/50">{subagent.model}</div>
+          )}
+
+          {subagent?.usage && (
+            <div className="text-[10px] tabular-nums text-muted-foreground/60">
+              {formatSubagentUsageLabel(subagent.usage)}
+            </div>
           )}
 
           {prompt && (

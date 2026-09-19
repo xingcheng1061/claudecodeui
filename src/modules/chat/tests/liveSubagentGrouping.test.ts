@@ -96,6 +96,107 @@ test('a growing live timeline invalidates the cached container projection', () =
   );
 });
 
+/** A live task status for the agent spawned by {@link taskRow}. */
+const taskStatus = (id: string, status: 'running' | 'completed' | 'stopped') => message(id, {
+  kind: 'subagent_update',
+  toolId: 'task-1',
+  subagent: { id: 'agent-1', status, toolUseId: 'task-1' },
+});
+
+test('a live task status folds into the container instead of rendering a row', () => {
+  const converted = normalizedToChatMessages([
+    taskRow(),
+    taskStatus('status-1', 'running'),
+  ]);
+
+  assert.equal(converted.length, 1, 'a status update is not a message the agent sent');
+  assert.equal(converted[0].subagent?.status, 'running');
+  assert.equal(converted[0].subagent?.toolUseId, 'task-1');
+});
+
+test('a live status outranks the status history attached to the same agent', () => {
+  // A mid-run history reload ships the agent as finished because its transcript
+  // is what the backend can read; the live stream is the only side that knows
+  // it is still going, so it has to win.
+  const fromHistory = message('task', {
+    kind: 'tool_use',
+    toolId: 'task-1',
+    toolName: 'Agent',
+    toolInput: {},
+    subagent: { id: 'agent-1', type: 'Explore', status: 'completed', toolUseId: 'task-1' },
+  });
+
+  const converted = normalizedToChatMessages([fromHistory, taskStatus('status-1', 'running')]);
+
+  assert.equal(converted[0].subagent?.status, 'running');
+  assert.equal(converted[0].subagent?.type, 'Explore', 'identity still comes from history');
+});
+
+test('a status that arrives before any metadata still makes a container', () => {
+  const converted = normalizedToChatMessages([taskRow(), taskStatus('status-1', 'stopped')]);
+
+  assert.equal(converted[0].isSubagentContainer, true);
+  assert.equal(converted[0].subagent?.status, 'stopped');
+});
+
+test('a moved status invalidates the cached container projection', () => {
+  const task = taskRow();
+  const running = taskStatus('status-1', 'running');
+
+  const initial = normalizedToChatMessages([task, running]);
+  assert.equal(initial[0].subagent?.status, 'running');
+
+  const updated = normalizedToChatMessages([task, running, taskStatus('status-2', 'completed')]);
+  assert.equal(
+    updated[0].subagent?.status,
+    'completed',
+    'the container must pick up a status that arrived after it was cached',
+  );
+});
+
+test('a stoppable agent stays stoppable when history loads behind it', () => {
+  // Only the live side knows whether the runtime still holds a task handle for the
+  // agent, and a history read never carries that. Dropping it in the merge would
+  // take the stop control away from a running agent the moment a reload landed —
+  // the one case the field exists for.
+  const fromHistory = message('task', {
+    kind: 'tool_use',
+    toolId: 'task-1',
+    toolName: 'Agent',
+    toolInput: {},
+    subagent: { id: 'agent-1', type: 'Explore', status: 'completed', toolUseId: 'task-1' },
+  });
+  const live = message('status-1', {
+    kind: 'subagent_update',
+    toolId: 'task-1',
+    subagent: { id: 'agent-1', status: 'running', toolUseId: 'task-1', canInterrupt: true },
+  });
+
+  const converted = normalizedToChatMessages([fromHistory, live]);
+
+  assert.equal(converted[0].subagent?.status, 'running');
+  assert.equal(
+    converted[0].subagent?.canInterrupt,
+    true,
+    'the stop control must survive a reload that lands mid-run',
+  );
+});
+
+test('a status naming an agent with no container is dropped', () => {
+  // Background shell commands are tasks too, but the transcript draws them as
+  // the Bash call itself — there is no card for a status to attach to.
+  const orphan = message('status-orphan', {
+    kind: 'subagent_update',
+    toolId: 'bash-9',
+    subagent: { id: 'task-bash', status: 'completed', toolUseId: 'bash-9' },
+  });
+
+  const converted = normalizedToChatMessages([taskRow(), orphan]);
+
+  assert.equal(converted.length, 1);
+  assert.equal(converted[0].subagent?.status, undefined);
+});
+
 test('the longer of the live and server timelines wins', () => {
   const serverTimeline = [
     { kind: 'tool' as const, toolId: 'bash-1', toolName: 'Bash' },

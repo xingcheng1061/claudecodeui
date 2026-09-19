@@ -83,6 +83,8 @@ This is the shared vocabulary every document uses. Both unions are declared in
 | `session_created` | provider | The runtime announcing its native id. **Swallowed server-side; no client ever sees it.** |
 | `history_truncated` | gateway | Rows at and after an anchor were superseded by an edit. Declared in `MessageKind`, but emitted by `chat-websocket.service.ts`, not by any runtime. |
 | `task_notification` | provider | A background task finished. |
+| `subagent_update` | provider | One lifecycle transition of a spawned subagent — started, progress with its running totals, or its closing status. Folded into the card for the tool call that spawned it; never drawn as a row. |
+| `thinking_delta` | provider | One increment of the model's reasoning, deliberately not sharing `stream_delta`: reasoning is not the answer, and folded into it the transcript would draw thinking as something the model said. Not a row of its own — it accumulates into the live `thinking` row, which is what the reader sees while the reasoning is still being written. Present only while partial messages are on (`CLAUDE_INCLUDE_PARTIAL_MESSAGES`, on by default). |
 | `chat_subscribed` | gateway | Ack for `chat.subscribe`: authoritative processing state plus pending permissions. |
 | `session_upserted` | gateway | Sidebar delta. Owned by the projects state, not by chat. |
 | `loading_progress` | gateway | Project scan progress. |
@@ -100,7 +102,8 @@ Handled by `server/modules/websocket/services/chat-websocket.service.ts`.
 | --- | --- |
 | `chat.send` | Start a run for a session. |
 | `chat.edit-send` | Replace an already-sent message and re-run from that anchor. |
-| `chat.abort` | Stop the running run. |
+| `chat.abort` | Stop the running run, and every agent it spawned. |
+| `chat.subagent-abort` | Stop one spawned agent, by the tool call that spawned it, without touching the run. |
 | `chat.subscribe` | Watch one or more sessions, replaying from `lastSeq`. |
 | `chat.permission-response` | Answer a `permission_request`. |
 

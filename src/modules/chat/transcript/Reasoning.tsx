@@ -63,6 +63,27 @@ export const Reasoning = React.memo<ReasoningProps>(
       [isControlled, onOpenChange]
     );
 
+    // Whether the reader has worked the toggle themselves. Once they have, the
+    // automatic half stands down for good.
+    //
+    // This matters more than it looks. A turn emits a `stream_end` — and so a rename
+    // of this row — once per content block, and `useChatRealtimeHandlers` finalises
+    // *both* channels on every one of them. So while a turn is still producing
+    // blocks, this row is renamed and remounted repeatedly, and its `isStreaming`
+    // flips with it. Each flip used to schedule a close one second later, which meant
+    // a reader who opened a block mid-turn watched it shut itself, over and over,
+    // until the turn stopped moving. Reading reasoning while it is written is the
+    // entire point of streaming it, and a disclosure that undoes the reader is not a
+    // disclosure.
+    const hasUserToggledRef = React.useRef(false);
+    const handleOpenChange = React.useCallback(
+      (next: boolean) => {
+        hasUserToggledRef.current = true;
+        setIsOpen(next);
+      },
+      [setIsOpen]
+    );
+
     // Duration tracking
     const [duration, setDuration] = React.useState<number | undefined>(durationProp);
     const hasEverStreamedRef = React.useRef(isStreaming);
@@ -89,14 +110,20 @@ export const Reasoning = React.memo<ReasoningProps>(
 
     // Auto-open when streaming starts
     React.useEffect(() => {
-      if (isStreaming && !isOpen && !isExplicitlyClosed) {
+      if (isStreaming && !isOpen && !isExplicitlyClosed && !hasUserToggledRef.current) {
         setIsOpen(true);
       }
     }, [isStreaming, isOpen, setIsOpen, isExplicitlyClosed]);
 
     // Auto-close after streaming ends
     React.useEffect(() => {
-      if (hasEverStreamedRef.current && !isStreaming && isOpen && !hasAutoClosed) {
+      if (
+        !hasUserToggledRef.current
+        && hasEverStreamedRef.current
+        && !isStreaming
+        && isOpen
+        && !hasAutoClosed
+      ) {
         const timer = setTimeout(() => {
           setIsOpen(false);
           setHasAutoClosed(true);
@@ -114,7 +141,7 @@ export const Reasoning = React.memo<ReasoningProps>(
       <ReasoningContext.Provider value={contextValue}>
         <Collapsible
           open={isOpen}
-          onOpenChange={setIsOpen}
+          onOpenChange={handleOpenChange}
           className={cn('not-prose', className)}
           {...props}
         >

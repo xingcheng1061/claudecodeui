@@ -240,6 +240,7 @@ const MessageComponent = memo(({ message, prevMessage, createDiff, onFileOpen, s
                  result — so it never goes through the tool input/result pair. */
               <SubagentPanel
                 toolInput={message.toolInput}
+                toolUseId={message.toolId}
                 toolResult={message.toolResult}
                 subagent={message.subagent}
                 activity={message.subagentActivity}
@@ -301,8 +302,13 @@ const MessageComponent = memo(({ message, prevMessage, createDiff, onFileOpen, s
                 )}
               </>
             ) : message.isThinking ? (
-              /* Thinking messages — Reasoning component (ai-elements pattern) */
-              <Reasoning defaultOpen={isExporting}>
+              /* Thinking messages — Reasoning component (ai-elements pattern).
+                 `isStreaming` is what holds the block open while the reasoning is still
+                 being produced and closes it once it settles. `defaultOpen` must stay
+                 unset on screen for that to work: an explicit `false` is read as the
+                 reader having shut it themselves, which suppresses the auto-open
+                 entirely. An export has nothing to click, so it opens instead. */
+              <Reasoning isStreaming={message.isStreaming} defaultOpen={isExporting ? true : undefined}>
                 <ReasoningTrigger />
                 <ReasoningContent>
                   <Markdown className="prose prose-sm prose-gray max-w-none font-serif dark:prose-invert">

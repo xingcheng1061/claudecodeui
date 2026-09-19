@@ -251,13 +251,63 @@ function isAssistantTextEchoedInSameTurnOnServer(
 }
 
 /**
+ * The two things that stream: the answer, and the reasoning behind it.
+ *
+ * They get a row each rather than sharing one, for the same reason the server keeps
+ * them apart: reasoning rendered inside the answer would read as something the model
+ * said. Separate rows are also what lets the reasoning block be collapsed on its own,
+ * without taking the prose it explains with it.
+ */
+type StreamChannel = 'text' | 'thinking';
+
+/** The row a channel's in-progress text lives in, under an id its next update replaces. */
+const STREAMING_ROW_ID_PREFIXES: Record<StreamChannel, string> = {
+  text: '__streaming_',
+  thinking: '__thinking_',
+};
+
+const STREAMING_ROW_PREFIXES = Object.values(STREAMING_ROW_ID_PREFIXES);
+
+function streamingRowId(sessionId: string, channel: StreamChannel) {
+  return `${STREAMING_ROW_ID_PREFIXES[channel]}${sessionId}`;
+}
+
+/**
+ * True while a row is still being written into, as opposed to one that has settled.
+ *
+ * The projection needs this to know whether a reasoning block should be open and
+ * growing or done, and the kind cannot say: a reasoning row keeps `thinking` for its
+ * whole life, because switching kind when the stream ends would make the block change
+ * shape as it settles. The id is what the store renames at that moment, so the id is
+ * what carries the distinction.
+ */
+export function isStreamingRow(message: { id?: string }): boolean {
+  const { id } = message;
+  return typeof id === 'string' && STREAMING_ROW_PREFIXES.some((prefix) => id.startsWith(prefix));
+}
+
+/**
+ * The kind a channel's row carries while it is still streaming.
+ *
+ * Reasoning keeps its final kind from the very first increment: the projection picks
+ * how to draw a row from its kind, so a reasoning row that spent its life looking like
+ * an answer would be drawn as one and then jump into a different shape.
+ */
+function streamingRowKind(channel: StreamChannel): NormalizedMessage['kind'] {
+  return channel === 'thinking' ? 'thinking' : 'stream_delta';
+}
+
+/**
  * After `finalizeStreaming`, the client holds a synthetic assistant `text` row
  * while the sessions API soon returns the same reply with a different id.
  * Those sit back-to-back in merged order and look like duplicate bubbles until
  * A persisted-tail refresh reconciles realtime. Collapse same-text assistant rows and
  * stream_placeholder → text when content matches.
+ *
+ * Exported for tests, which pin the pairing directly — the alternative is driving a
+ * whole streamed turn through the store to observe the same two rows.
  */
-function dedupeAdjacentAssistantEchoes(merged: NormalizedMessage[]): NormalizedMessage[] {
+export function dedupeAdjacentAssistantEchoes(merged: NormalizedMessage[]): NormalizedMessage[] {
   const out: NormalizedMessage[] = [];
   for (const m of merged) {
     const prev = out[out.length - 1];
@@ -270,14 +320,15 @@ function dedupeAdjacentAssistantEchoes(merged: NormalizedMessage[]): NormalizedM
           continue;
         }
       }
-      if (
-        prev.kind === 'text'
-        && m.kind === 'text'
-        && prev.role === 'assistant'
-        && m.role === 'assistant'
-      ) {
-        const ms = (m.content || '').trim();
-        if (ms.length > 0 && ms === (prev.content || '').trim()) {
+      // The live reasoning row and the completed block that supersedes it. Reasoning
+      // has no placeholder kind to tell the pair apart by — its live row is already
+      // `thinking` — so same kind plus same text is the whole test, and the completed
+      // row is the one kept: it is what the transcript hands back on the next refresh,
+      // where the live row is an id nothing else refers to.
+      if (prev.kind === 'thinking' && m.kind === 'thinking') {
+        const ps = (prev.content || '').trim();
+        if (ps.length > 0 && ps === (m.content || '').trim()) {
+          out[out.length - 1] = m;
           continue;
         }
       }
@@ -807,15 +858,15 @@ export function useSessionStore() {
    * Update or create a streaming message (accumulated text so far).
    * Uses a well-known ID so subsequent calls replace the same message.
    */
-  const updateStreaming = useCallback((sessionId: string, accumulatedText: string, msgProvider: LLMProvider) => {
+  const updateStreaming = useCallback((sessionId: string, accumulatedText: string, msgProvider: LLMProvider, channel: StreamChannel = 'text') => {
     const slot = getSlot(sessionId);
-    const streamId = `__streaming_${sessionId}`;
+    const streamId = streamingRowId(sessionId, channel);
     const msg: NormalizedMessage = {
       id: streamId,
       sessionId,
       timestamp: new Date().toISOString(),
       provider: msgProvider,
-      kind: 'stream_delta',
+      kind: streamingRowKind(channel),
       content: accumulatedText,
     };
     const idx = slot.realtimeMessages.findIndex(m => m.id === streamId);
@@ -833,18 +884,18 @@ export function useSessionStore() {
    * Finalize streaming: convert the streaming message to a regular text message.
    * The well-known streaming ID is replaced with a unique text message ID.
    */
-  const finalizeStreaming = useCallback((sessionId: string) => {
+  const finalizeStreaming = useCallback((sessionId: string, channel: StreamChannel = 'text') => {
     const slot = storeRef.current.get(sessionId);
     if (!slot) return;
-    const streamId = `__streaming_${sessionId}`;
+    const streamId = streamingRowId(sessionId, channel);
     const idx = slot.realtimeMessages.findIndex(m => m.id === streamId);
     if (idx >= 0) {
       const stream = slot.realtimeMessages[idx];
       slot.realtimeMessages = [...slot.realtimeMessages];
       slot.realtimeMessages[idx] = {
         ...stream,
-        id: `text_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-        kind: 'text',
+        id: `${channel}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        kind: channel === 'thinking' ? 'thinking' : 'text',
         role: 'assistant',
       };
       recomputeMergedIfNeeded(slot);

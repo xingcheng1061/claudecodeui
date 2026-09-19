@@ -1,3 +1,5 @@
+import type { SubagentUsage } from '@/shared/types';
+
 export function normalizeInlineCodeFences(text: string) {
   if (!text || typeof text !== 'string') return text;
   try {
@@ -63,4 +65,31 @@ export function formatUsageLimitText(text: string) {
   } catch {
     return text;
   }
+}
+
+/**
+ * One subagent's cost as a single compact line — tokens, tool calls, elapsed
+ * time — used by the subagent list and by the card it points at so the two
+ * never disagree.
+ *
+ * Zero-valued parts are dropped rather than shown as `0 tools`: a figure the
+ * provider never reported is not the same as a figure that is zero.
+ */
+export function formatSubagentUsageLabel(usage: SubagentUsage) {
+  const parts: string[] = [];
+
+  if (usage.totalTokens > 0) {
+    parts.push(usage.totalTokens >= 1_000
+      ? `${Math.round(usage.totalTokens / 1_000)}k tokens`
+      : `${usage.totalTokens} tokens`);
+  }
+  if (usage.toolUses > 0) {
+    parts.push(`${usage.toolUses} ${usage.toolUses === 1 ? 'tool' : 'tools'}`);
+  }
+  if (usage.durationMs > 0) {
+    const seconds = Math.round(usage.durationMs / 1_000);
+    parts.push(seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`);
+  }
+
+  return parts.join(' · ');
 }

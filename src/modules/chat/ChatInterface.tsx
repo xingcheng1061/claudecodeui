@@ -1,10 +1,11 @@
-import React, { useCallback, useEffect, useMemo, useRef } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { ArrowDownIcon } from 'lucide-react';
 
 import { useTasksSettings } from '@/modules/task-master';
 import { useWebSocket } from '@/shared/context/WebSocketContext';
 import PermissionContext from '@/modules/chat/context/PermissionContext';
+import SubagentFocusContext from '@/modules/chat/context/SubagentFocusContext';
 import { MarkdownWorkspaceContext } from '@/modules/chat/context/MarkdownWorkspaceContext';
 import { api } from '@/shared/api';
 import type {
@@ -20,6 +21,7 @@ import { useChatSessionState } from '@/modules/chat/hooks/useChatSessionState';
 import { useChatRealtimeHandlers } from '@/modules/chat/hooks/useChatRealtimeHandlers';
 import { useChatComposerState } from '@/modules/chat/hooks/useChatComposerState';
 import { useSessionStore } from '@/modules/chat/hooks/useSessionStore';
+import { useSessionSubagents } from '@/modules/chat/hooks/useSessionSubagents';
 import {
   useProcessingSessions,
   useSessionProtectionActions,
@@ -27,6 +29,7 @@ import {
 import ChatMessagesPane from '@/modules/chat/transcript/ChatMessagesPane';
 import ChatComposer from '@/modules/chat/composer/ChatComposer';
 import CommandResultModal from '@/modules/chat/modals/CommandResultModal';
+import { SubagentsPanel } from '@/modules/chat/subagents/SubagentsPanel';
 
 type ChatInterfaceProps = {
   isActive: boolean;
@@ -373,6 +376,54 @@ function ChatInterface({
     projectId: selectedProject?.projectId ?? null,
   }), [selectedProject?.projectId]);
 
+  // The subagent the reader picked in the subagent list, by the tool call that
+  // spawned it. Held here because the list and the transcript card that has to
+  // react to it are siblings under this component.
+  const [focusedSubagentToolUseId, setFocusedSubagentToolUseId] = useState<string | null>(null);
+  // Bumped on every request, including a re-request of the agent already focused: the card
+  // has to come back into view even when its focus never lapsed.
+  const [subagentFocusToken, setSubagentFocusToken] = useState(0);
+  const subagentFocusValue = useMemo(() => ({
+    focusedToolUseId: focusedSubagentToolUseId,
+    focusToken: subagentFocusToken,
+    focusSubagent: (toolUseId: string | null) => {
+      setFocusedSubagentToolUseId(toolUseId);
+      setSubagentFocusToken((token) => token + 1);
+    },
+  }), [focusedSubagentToolUseId, subagentFocusToken]);
+
+  /**
+   * Stops one subagent without stopping the run that spawned it.
+   *
+   * The session id is resolved here rather than handed down from the list: the list
+   * deals in tool calls, and a tool call only means something together with the
+   * session it belongs to. The outcome is not tracked here — the backend reports it
+   * as a `subagent_update` on the same stream as every other agent state change, so
+   * the row updates itself and there is no second copy of the truth to drift.
+   */
+  /**
+   * The session's subagents, from their own endpoint.
+   *
+   * Resolved here rather than inside the panel because the read is per session and the panel
+   * is drawn per session too — and because a list derived from the transcript's paging loses
+   * every agent whose spawn row is not loaded, which in a long conversation is most of them.
+   */
+  const {
+    subagents,
+    activityByAgent,
+    loadingAgentIds,
+    loadActivity: loadSubagentActivity,
+  } = useSessionSubagents(currentSessionId || selectedSession?.id || null);
+
+  const handleStopSubagent = useCallback((toolUseId: string) => {
+    const targetSessionId = currentSessionId || selectedSession?.id || null;
+    if (!targetSessionId) {
+      console.warn('Subagent stop requested but no session ID is available.');
+      return;
+    }
+    sendMessage({ type: 'chat.subagent-abort', sessionId: targetSessionId, toolUseId });
+  }, [currentSessionId, selectedSession?.id, sendMessage]);
+
   // A composer pick becomes the default for new chats and, when a session is
   // open, is recorded against that session so reopening it restores this model.
   const handleSelectComposerModel = useCallback(async (model: string) => {
@@ -421,7 +472,7 @@ function ChatInterface({
   }
 
 
-  return (
+  const content = (
     <PermissionContext.Provider value={permissionContextValue}>
       <div className="flex h-full min-h-0 flex-col">
         <MarkdownWorkspaceContext.Provider value={markdownWorkspaceValue}>
@@ -479,6 +530,16 @@ function ChatInterface({
             onLoadFullTranscript={loadFullTranscript}
           />
         </MarkdownWorkspaceContext.Provider>
+
+        <SubagentsPanel
+          messages={chatMessages}
+          subagents={subagents}
+          activityByAgent={activityByAgent}
+          loadingAgentIds={loadingAgentIds}
+          onLoadActivity={loadSubagentActivity}
+          onLoadMissingCard={loadAllMessages}
+          onStopSubagent={handleStopSubagent}
+        />
 
         <div className="relative flex-shrink-0">
           {isUserScrolledUp && chatMessages.length > 0 && (
@@ -580,6 +641,15 @@ function ChatInterface({
         onSelectProviderModel={selectProviderModel}
       />
     </PermissionContext.Provider>
+  );
+
+  // Provided around the whole chat surface: the subagent list above the
+  // composer and the transcript card it scrolls to are siblings, so the focused
+  // agent has to be shared rather than threaded through the message list.
+  return (
+    <SubagentFocusContext.Provider value={subagentFocusValue}>
+      {content}
+    </SubagentFocusContext.Provider>
   );
 }
 

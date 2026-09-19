@@ -73,6 +73,7 @@ export type ProviderRuntimeGateway = {
     writer: ProviderRuntimeWriter,
   ): Promise<unknown>;
   abort(provider: LLMProvider, sessionId: string): Promise<boolean>;
+  abortSubagent(sessionId: string, toolUseId: string): Promise<boolean>;
   resolveToolApproval(requestId: string, payload: ProviderPermissionDecision): void;
   getPendingApprovalsForSession(sessionId: string): unknown[];
 };
@@ -438,6 +439,54 @@ async function handleChatAbort(
 }
 
 /**
+ * Handles `chat.subagent-abort`: stops one spawned agent without touching the run
+ * that started it.
+ *
+ * Deliberately not gated on an active run. The agents this exists for are the ones
+ * that outlive their turn, so by the time the user reaches for the control the run
+ * that started them has usually already reported `complete` — requiring one would
+ * disable the control exactly when it is wanted.
+ *
+ * The outcome is not reported from here. The runtime that owns the task sends
+ * `subagent_update` with status `stopped` on the run stream, so the client learns
+ * what happened over the same channel as every other lifecycle change and the two
+ * can never disagree. Only a request that could not be honoured at all is answered
+ * here, and it is answered as an error rather than as a success.
+ */
+async function handleChatSubagentAbort(
+  ws: WebSocket,
+  data: AnyRecord,
+  dependencies: ChatWebSocketDependencies
+): Promise<void> {
+  const sessionId = readRequiredSessionId(data);
+  if (!sessionId) {
+    sendProtocolError(ws, 'SESSION_ID_REQUIRED', 'chat.subagent-abort requires a sessionId.');
+    return;
+  }
+
+  const toolUseId = typeof data.toolUseId === 'string' ? data.toolUseId.trim() : '';
+  if (!toolUseId) {
+    sendProtocolError(
+      ws,
+      'TOOL_USE_ID_REQUIRED',
+      'chat.subagent-abort requires the toolUseId of the agent to stop.',
+      sessionId
+    );
+    return;
+  }
+
+  const stopped = await dependencies.runtime.abortSubagent(sessionId, toolUseId);
+  if (!stopped) {
+    sendProtocolError(
+      ws,
+      'SUBAGENT_NOT_RUNNING',
+      `No running subagent for tool call "${toolUseId}" in session "${sessionId}".`,
+      sessionId
+    );
+  }
+}
+
+/**
  * Handles `chat.subscribe`: for each requested session, reports whether a run
  * is processing, re-attaches the live stream to this socket, replays missed
  * events (seq > lastSeq), and includes pending permission requests.
@@ -527,6 +576,7 @@ function handlePermissionResponse(data: AnyRecord, dependencies: ChatWebSocketDe
  * Inbound protocol (client to server):
  * - `chat.send`                { sessionId, content, options? }
  * - `chat.abort`               { sessionId }
+ * - `chat.subagent-abort`      { sessionId, toolUseId }
  * - `chat.subscribe`           { sessions: [{ sessionId, lastSeq? }] }
  * - `chat.permission-response` { requestId, allow, updatedInput?, message?, rememberEntry? }
  *
@@ -629,6 +679,9 @@ export function handleChatConnection(
           return;
         case 'chat.abort':
           await handleChatAbort(ws, data, dependencies);
+          return;
+        case 'chat.subagent-abort':
+          await handleChatSubagentAbort(ws, data, dependencies);
           return;
         case 'chat.subscribe':
           handleChatSubscribe(ws, data, dependencies);
