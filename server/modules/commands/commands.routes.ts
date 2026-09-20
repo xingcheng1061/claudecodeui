@@ -207,6 +207,36 @@ const builtInCommands = [
 ];
 
 /**
+ * CLI-native commands: executed by the Claude Code CLI itself, not by this
+ * server. They are listed in /help so readers can discover them, but they are
+ * deliberately NOT registered for the command palette: the palette resolves a
+ * hit through /api/commands/execute, whose custom branch stuffs the resolved
+ * content back into the composer for resubmission — a native command like
+ * /compact would come back as text and resubmit itself, forever.
+ */
+const cliNativeCommands = [
+  { name: "/compact", description: "Compact the conversation to free context space" },
+  { name: "/clear", description: "Clear the conversation and start fresh" },
+  { name: "/init", description: "Generate a CLAUDE.md guide for the project" },
+  { name: "/review", description: "Review a pull request or the current changes" },
+  { name: "/add-dir", description: "Add another working directory to the session" },
+  { name: "/agents", description: "Manage subagent configurations" },
+  { name: "/mcp", description: "Manage MCP server connections" },
+  { name: "/permissions", description: "View and manage tool permissions" },
+  { name: "/todos", description: "Show the current task list" },
+  { name: "/usage", description: "Show plan usage limits" },
+  { name: "/export", description: "Export the conversation to a file or clipboard" },
+  { name: "/resume", description: "Resume a previous conversation" },
+  { name: "/ide", description: "Manage IDE integrations" },
+  { name: "/vim", description: "Toggle vim keybinding mode" },
+  { name: "/login", description: "Switch Anthropic account" },
+  { name: "/logout", description: "Sign out of the current account" },
+  { name: "/doctor", description: "Diagnose the CLI installation" },
+  { name: "/bug", description: "Report a bug to Anthropic" },
+  { name: "/terminal-setup", description: "Install the Shift+Enter key binding for newlines" },
+];
+
+/**
  * Built-in command handlers
  * Each handler returns { type: 'builtin', action: string, data: any }
  */
@@ -217,6 +247,19 @@ const builtInHandlers = {
 ## Built-in Commands
 
 ${builtInCommands
+  .map(
+    (cmd) => `### ${cmd.name}
+${cmd.description}
+`,
+  )
+  .join("\n")}
+
+## CLI Commands
+
+Handled natively by the Claude Code CLI — type them in the composer and the
+CLI executes them itself:
+
+${cliNativeCommands
   .map(
     (cmd) => `### ${cmd.name}
 ${cmd.description}
@@ -249,7 +292,10 @@ Custom commands can be created in:
       data: {
         content: helpText,
         format: "markdown",
-        commands: builtInCommands.map((command) => ({
+        commands: [
+          ...builtInCommands,
+          ...cliNativeCommands.map((command) => ({ ...command, namespace: "cli" })),
+        ].map((command) => ({
           name: command.name,
           description: command.description,
           namespace: command.namespace,

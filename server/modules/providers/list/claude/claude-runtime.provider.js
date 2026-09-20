@@ -30,6 +30,10 @@ import {
 } from '@/modules/providers/list/claude/claude-models.provider.js';
 import { resolveClaudeCodeExecutablePath } from '@/shared/claude-cli-path.js';
 import {
+  learnContextWindowsFromResult,
+  resolveContextWindow
+} from '@/modules/providers/shared/context-window.js';
+import {
   createNotificationEvent,
   notifyBackgroundWorkCompleted,
   notifyRunFailed,
@@ -335,6 +339,13 @@ function mapCliOptionsToSDK(options = {}) {
 
   sdkOptions.settingSources = ['project', 'user', 'local'];
 
+  // Forward the subagent conversation itself (its text and thinking), not just
+  // the tool_use/tool_result heartbeat. The client folds these rows into the
+  // agent's card — the transcript read after a refresh has them, so without
+  // this the live card showed only tool calls and changed shape depending on
+  // whether you were watching it happen or reading it afterwards.
+  sdkOptions.forwardSubagentText = true;
+
   // The SDK resumes with the provider-native session id, never the app id.
   // `resumeFromScratch` is set when the very first prompt of a conversation was
   // edited: there is nothing before it to resume through, so the turn has to
@@ -500,21 +511,42 @@ function readNumber(value) {
  */
 
 /**
+ * True when a usage payload carries no tokens at all.
+ *
+ * Local commands (a /compact, for one) run through the same stream and emit
+ * assistant-shaped messages whose usage is all zeroes. Building a budget from
+ * one of those would push a "0 used" frame at the composer and wipe the count
+ * the previous assistant message had just set.
+ * @param {Object} messageUsage - Anthropic-shaped usage payload
+ * @returns {boolean}
+ */
+function isEmptyUsage(messageUsage) {
+  const counters = [
+    messageUsage.input_tokens ?? messageUsage.inputTokens,
+    messageUsage.output_tokens ?? messageUsage.outputTokens,
+    messageUsage.cache_creation_input_tokens ?? messageUsage.cacheCreationInputTokens ?? messageUsage.cacheCreationTokens,
+    messageUsage.cache_read_input_tokens ?? messageUsage.cacheReadInputTokens ?? messageUsage.cacheReadTokens,
+  ];
+  return counters.every((value) => !readNumber(value));
+}
+
+/**
  * Builds a context-window budget from an Anthropic-shaped usage payload.
  *
  * `input_tokens + cache_read + cache_creation` is one request's whole prompt,
  * which is exactly what the context window holds at that moment.
  * @param {Object} messageUsage - Anthropic usage payload
+ * @param {string|null} [model] - Model the payload belongs to, for the denominator
  * @returns {TokenBudget} Token budget object
  */
-function buildTokenBudget(messageUsage) {
+function buildTokenBudget(messageUsage, model = null) {
   const directInputTokens = readNumber(messageUsage.input_tokens ?? messageUsage.inputTokens);
   const cacheCreationTokens = readNumber(messageUsage.cache_creation_input_tokens ?? messageUsage.cacheCreationInputTokens ?? messageUsage.cacheCreationTokens);
   const cacheReadTokens = readNumber(messageUsage.cache_read_input_tokens ?? messageUsage.cacheReadInputTokens ?? messageUsage.cacheReadTokens);
   const cacheTokens = cacheCreationTokens + cacheReadTokens;
   const inputTokens = directInputTokens + cacheTokens;
   const outputTokens = readNumber(messageUsage.output_tokens ?? messageUsage.outputTokens);
-  const contextWindow = parseInt(process.env.CONTEXT_WINDOW, 10) || 160000;
+  const contextWindow = resolveContextWindow(model);
 
   return {
     used: inputTokens + outputTokens,
@@ -565,7 +597,13 @@ function extractTokenBudget(sdkMessage) {
     return null;
   }
 
-  return buildTokenBudget(messageUsage);
+  // An all-zero payload would publish "0 used" and reset the counter the last
+  // real assistant message had just set.
+  if (isEmptyUsage(messageUsage)) {
+    return null;
+  }
+
+  return buildTokenBudget(messageUsage, sdkMessage.message?.model);
 }
 
 /**
@@ -589,8 +627,22 @@ function extractCumulativeTokenBudget(sdkMessage) {
     return null;
   }
 
+  // The single modelUsage key names the model the turn billed, which is the
+  // best denominator hint a result carries; `model` is the fallback for
+  // builds that expose it directly.
+  const resultModel = sdkMessage.model
+    ?? (sdkMessage.modelUsage && typeof sdkMessage.modelUsage === 'object'
+      ? Object.keys(sdkMessage.modelUsage)[0]
+      : null);
+
   if (sdkMessage.usage && typeof sdkMessage.usage === 'object') {
-    return buildTokenBudget(sdkMessage.usage);
+    // Same all-zero hazard as the assistant path: a local command's result
+    // must not zero out a counter something else set.
+    if (isEmptyUsage(sdkMessage.usage)) {
+      return null;
+    }
+
+    return buildTokenBudget(sdkMessage.usage, resultModel);
   }
 
   if (!sdkMessage.modelUsage || typeof sdkMessage.modelUsage !== 'object') {
@@ -608,7 +660,7 @@ function extractCumulativeTokenBudget(sdkMessage) {
   const inputTokens = readNumber(modelData.cumulativeInputTokens ?? modelData.inputTokens);
   const outputTokens = readNumber(modelData.cumulativeOutputTokens ?? modelData.outputTokens);
   const totalUsed = inputTokens + outputTokens;
-  const contextWindow = parseInt(process.env.CONTEXT_WINDOW, 10) || 160000;
+  const contextWindow = resolveContextWindow(modelKey);
 
   return {
     used: totalUsed,
@@ -620,6 +672,52 @@ function extractCumulativeTokenBudget(sdkMessage) {
       output: outputTokens,
     },
   };
+}
+
+/**
+ * True when an SDK message marks a context compaction.
+ *
+ * The CLI reports the boundary as a system message with `subtype:
+ * 'compact_boundary'`; the SDK passes it through untyped, so nothing here can
+ * be trusted to a shape — both the system-wrapped and the top-level forms are
+ * read.
+ * @param {Object} sdkMessage - SDK stream message
+ * @returns {boolean}
+ */
+function isCompactionEvent(sdkMessage) {
+  if (!sdkMessage || typeof sdkMessage !== 'object') {
+    return false;
+  }
+
+  if (sdkMessage.type === 'compact_boundary') {
+    return true;
+  }
+
+  return sdkMessage.type === 'system' && sdkMessage.subtype === 'compact_boundary';
+}
+
+/**
+ * Reads the context size a compaction left behind.
+ *
+ * `post_tokens` is what the window holds after the boundary — everything the
+ * conversation was compacted into. It is the honest budget for the fresh
+ * window: the next assistant message would report it too, but only after the
+ * next request has already been made.
+ * @param {Object} sdkMessage - SDK stream message
+ * @returns {number|null} Post-compaction token count, or null
+ */
+function readCompactBoundaryTokens(sdkMessage) {
+  if (!isCompactionEvent(sdkMessage)) {
+    return null;
+  }
+
+  const metadata = sdkMessage.compact_metadata ?? sdkMessage.compactMetadata;
+  if (!metadata || typeof metadata !== 'object') {
+    return null;
+  }
+
+  const postTokens = readNumber(metadata.post_tokens ?? metadata.postTokens);
+  return postTokens > 0 ? postTokens : null;
 }
 
 // Tool calls that leave work running past the end of a turn. Bash and Agent only
@@ -1365,6 +1463,39 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
           continue;
         }
         ws.send(msg);
+      }
+
+      // Learn the real context window from the turn's bill. The SDK's model
+      // info carries no window; `result.modelUsage[<model>].contextWindow`
+      // does. Learning it here is what lets the composer's denominator follow
+      // the model actually in use — a 1M-window model read against the 160k
+      // default looks permanently nearly-full.
+      learnContextWindowsFromResult(message);
+
+      // A compaction turn rewrites the window: the assistant budget read
+      // earlier belongs to the pre-compact conversation, and the turn-ending
+      // bill is the compaction's own. Latch the assistant flag so neither can
+      // overwrite what follows, and publish `post_tokens` — the size of the
+      // window the conversation actually resumes into.
+      const compactedTokens = readCompactBoundaryTokens(message);
+      if (compactedTokens !== null) {
+        assistantBudgetSent = true;
+        ws.send(createNormalizedMessage({
+          kind: 'status',
+          text: 'token_budget',
+          tokenBudget: {
+            used: compactedTokens,
+            total: resolveContextWindow(),
+            inputTokens: compactedTokens,
+            outputTokens: 0,
+            breakdown: {
+              input: compactedTokens,
+              output: 0,
+            },
+          },
+          sessionId: capturedSessionId || sessionId || null,
+          provider: 'claude'
+        }));
       }
 
       // Extract and send token budget updates from assistant usage payloads,

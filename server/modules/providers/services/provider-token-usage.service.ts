@@ -6,6 +6,7 @@ import path from 'node:path';
 import Database from 'better-sqlite3';
 
 import { sessionsDb } from '@/modules/database/index.js';
+import { resolveContextWindow } from '@/modules/providers/shared/context-window.js';
 import type { AnyRecord } from '@/shared/types.js';
 import { AppError, getOpenCodeDatabasePath } from '@/shared/utils.js';
 
@@ -244,7 +245,15 @@ export function summarizeClaudeTokenUsage(
     break;
   }
 
-  const parsedContextWindow = Number.parseInt(configuredContextWindow ?? '', 10);
+  // The cost-state transcript rows this summary reads carry no contextWindow
+  // of their own, so without the shared learned cache this chain would always
+  // divide by the 160k default — while the composer, which shares the runtime's
+  // cache, divided by the model's real window.
+  const resolvedContextWindow = configuredContextWindow ?? resolveContextWindow();
+  const parsedContextWindow =
+    typeof resolvedContextWindow === 'number'
+      ? resolvedContextWindow
+      : Number.parseInt(resolvedContextWindow, 10);
   const contextWindow = Number.isFinite(parsedContextWindow) ? parsedContextWindow : 160_000;
   const cacheTokens = cacheReadTokens + cacheCreationTokens;
 
