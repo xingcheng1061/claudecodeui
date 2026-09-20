@@ -863,6 +863,52 @@ function reportTaskStopped(session, sessionId, taskId, toolUseId) {
 }
 
 /**
+ * Reports a terminal `stopped` for every task still on the registry when the
+ * run itself is winding down — the stream has ended or the process has failed,
+ * so the CLI will never send their `task_notification`.
+ *
+ * `task_notification` is the only event that retires a task, which is why a
+ * process that dies (or a release that lands before the notification does)
+ * leaves the client's card pulsing forever: nothing ever contradicts the last
+ * `task_started`. Sending it here does not conflict with the abort path, which
+ * reports through `settleAskedTasks` before the same registry is cleared.
+ *
+ * Duplicates are harmless either way — the client folds updates into the same
+ * card. Entries without a spawning tool call are skipped: there is no card to
+ * report against.
+ *
+ * @param {Object} ws - WebSocket writer for the run's client
+ * @param {string|null} sessionId - Session identifier
+ * @param {Map} runningTasks - Task id to spawning tool-use id
+ */
+function settleRunningTasks(ws, sessionId, runningTasks) {
+  if (!runningTasks || runningTasks.size === 0) {
+    return;
+  }
+
+  for (const [taskId, toolUseId] of runningTasks.entries()) {
+    if (!toolUseId) {
+      continue;
+    }
+
+    try {
+      ws?.send?.(createNormalizedMessage({
+        id: `${sessionId}_task_stopped_${taskId}`,
+        sessionId,
+        timestamp: new Date().toISOString(),
+        provider: 'claude',
+        kind: 'subagent_update',
+        toolId: toolUseId,
+        subagent: { id: taskId, status: 'stopped', toolUseId },
+      }));
+    } catch (error) {
+      console.warn(`Failed to settle task ${taskId} for session ${sessionId}:`, error?.message || error);
+    }
+  }
+  runningTasks.clear();
+}
+
+/**
  * Sends one `stop_task` and reports whether the runtime accepted it.
  *
  * Bounded, because a control channel that has stopped answering must not leave a
@@ -1074,23 +1120,71 @@ async function buildPromptMessages(command, images, files, cwd) {
  * of the run and kills anything still going in the background, so the iterable
  * has to stay pending until we actually want the process gone.
  *
+ * `push` feeds additional turns into the live stream: the CLI's stream-input
+ * mode reads the next user message from stdin once the current turn ends, so a
+ * pushed message is the whole of "send this queued message now". After release,
+ * push reports false — the stream is closing and a turn pushed into it would
+ * never be read.
+ *
  * @param {Array<Object>} messages - SDKUserMessage records to send
- * @returns {{ stream: AsyncIterable, release: () => void }} Stream plus its closer
+ * @returns {{ stream: AsyncIterable, push: (message: Object) => boolean, release: () => void }}
  */
 function createHeldPromptStream(messages) {
   let release;
   const held = new Promise((resolve) => { release = resolve; });
+  let notifyArrival = null;
+  let released = false;
+  const pending = [];
 
   const stream = (async function* () {
     for (const message of messages) {
       yield message;
     }
-    // Keeps stdin open — the CLI stays alive until release() is called.
-    await held;
+    // Keeps stdin open — the CLI stays alive until release() is called — and
+    // feeds anything pushed while it is open as further turns.
+    while (!released) {
+      if (pending.length > 0) {
+        yield pending.shift();
+        continue;
+      }
+      // Park until a push arrives or the release ends the stream. The resolver
+      // is refreshed per wait: pushes that land while the generator is busy
+      // yielding simply queue up and are drained by the check above.
+      await new Promise((resolve) => {
+        notifyArrival = resolve;
+        // release() may already have been called between checks.
+        if (released) {
+          resolve();
+        }
+      });
+    }
   })();
 
-  return { stream, release };
+  return {
+    stream,
+    push(message) {
+      if (released) {
+        return false;
+      }
+      pending.push(message);
+      notifyArrival?.();
+      return true;
+    },
+    release() {
+      if (released) {
+        return;
+      }
+      released = true;
+      release();
+    },
+  };
 }
+
+// Live held streams by session key, so a queued message can be pushed into the
+// run that is actually holding the session's process. Entries are registered
+// when a run starts and removed when it ends, always guarded by identity: a run
+// replaced by a newer one must not delete the newer run's entry.
+const heldPromptStreams = new Map();
 
 /**
  * Loads MCP server configurations from ~/.claude.json
@@ -1200,6 +1294,12 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
   // Set once a turn publishes a budget read from an assistant message, so the
   // turn-ending `result` is only mined for usage when nothing better arrived.
   let assistantBudgetSent = false;
+  // Injected queued turns and results seen. A run starts expecting exactly one
+  // result — the initial turn's — and every successful push raises that by one;
+  // a `result` with turns still outstanding is intermediate, and the terminal
+  // `complete` waits for the last one.
+  let injectedTurnCount = 0;
+  let resultCount = 0;
 
   // A new turn supersedes any earlier one still holding this session's process
   // open, so held runs cannot stack up across a conversation.
@@ -1224,6 +1324,9 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
   // Hoisted above the try so the catch's cleanup can tell whether this run
   // still owns the activeSessions entry (or was superseded by a newer run).
   let queryInstance = null;
+  // Same hoisting for the injection point: the finally block must be able to
+  // name it even when the try failed before the stream existed at all.
+  let heldPromptHandle = null;
 
   try {
     const resolvedModel = await context.resolveResumeModel(sessionId, options.model);
@@ -1409,6 +1512,25 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
       addSession(sessionKey(), queryInstance, ws, releasePromptStream, abortController, runningTasks);
     }
 
+    // Expose this run's held stream as an injection point. A push that the
+    // stream accepted is one more turn the CLI owes a result for, and the idle
+    // ceiling re-arms so the hold cannot expire while a queued turn is owed.
+    // Identity-guarded cleanup in the finally block keeps a superseding run's
+    // registration intact.
+    heldPromptHandle = {
+      push(message) {
+        const accepted = heldPrompt.push(message);
+        if (accepted) {
+          injectedTurnCount += 1;
+          scheduleRelease();
+        }
+        return accepted;
+      },
+    };
+    if (sessionKey()) {
+      heldPromptStreams.set(sessionKey(), heldPromptHandle);
+    }
+
     // Process streaming messages
     console.log('Starting async generator loop for session:', capturedSessionId || 'NEW');
     for await (const message of queryInstance) {
@@ -1515,6 +1637,8 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
       }
 
       if (message.type === 'result') {
+        resultCount += 1;
+
         // One line per turn: enough to tell whether partial events are arriving and
         // whether reasoning is among them, without a client attached. A turn that
         // answers in text but streams none of it is the failure this exists to catch.
@@ -1524,9 +1648,15 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
         textDeltaCount = 0;
         thinkingDeltaCount = 0;
 
-        // The turn is done as far as the client is concerned.
+        // A result with turns still owed — a queued message was pushed
+        // mid-turn — is intermediate: the client stays processing and stdin
+        // stays open until the last injected turn lands. Only then does the
+        // terminal `complete` go out.
         const abortPending = sessionKey() ? abortedSessionIds.has(sessionKey()) : false;
-        if (!turnCompleteSent && !abortPending) {
+        const pendingInjectedTurns = !abortPending && injectedTurnCount + 1 - resultCount > 0;
+        if (pendingInjectedTurns) {
+          scheduleRelease();
+        } else if (!turnCompleteSent && !abortPending) {
           turnCompleteSent = true;
           ws.send(createCompleteMessage({ provider: 'claude', sessionId: capturedSessionId || sessionId || null, exitCode: 0 }));
           notifyRunStopped({
@@ -1546,7 +1676,9 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
             sessionName: sessionSummary
           });
         }
-        if (backgroundWorkPending) {
+        if (pendingInjectedTurns) {
+          // Hold for the injected turn; the schedule above re-armed the ceiling.
+        } else if (backgroundWorkPending) {
           // Work started during this turn is still running. Hold the process
           // open so it can finish and report back in a follow-up turn; the
           // ceiling is only a backstop for work that never reports.
@@ -1575,6 +1707,13 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
     // A superseded run winds down silently: the map entry, the abort flag,
     // and all client-facing events belong to the run that replaced it.
     const superseded = supersededInstances.has(queryInstance);
+
+    // The stream has ended, so any task still registered will never send its
+    // own notification — report the terminal the CLI will not. Superseded runs
+    // say nothing: the run that replaced them owns the client.
+    if (!superseded) {
+      settleRunningTasks(ws, capturedSessionId || sessionId || null, runningTasks);
+    }
 
     // Send the terminal completion event — skipped for aborted runs, whose
     // terminal `complete` (aborted: true) was already sent by abort-session, and
@@ -1614,8 +1753,14 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
     if (wasAborted) {
       // The abort already produced the terminal complete; a generator throw
       // caused by interrupt() is expected noise, not a user-facing error.
+      // Tasks were settled by the abort path itself (settleAskedTasks).
       return;
     }
+
+    // The process is failing outright — tasks still on the registry will never
+    // report. Settle them before the error surfaces, so the cards end in a
+    // terminal state rather than pulsing behind an error row.
+    settleRunningTasks(ws, capturedSessionId || sessionId || null, runningTasks);
 
     // Check if Claude CLI is installed for a clearer error message
     const installed = await context.isProviderInstalled();
@@ -1645,6 +1790,11 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
       idleReleaseTimer = null;
     }
     releasePromptStream();
+    // Identity-guarded: a queued message may have started the session's next
+    // run before this promise settles, and that run owns the entry now.
+    if (sessionKey() && heldPromptStreams.get(sessionKey()) === heldPromptHandle) {
+      heldPromptStreams.delete(sessionKey());
+    }
   }
 }
 
@@ -1741,10 +1891,20 @@ async function abortClaudeSDKSession(sessionId, options = {}) {
     // ceiling, which is BG_WAIT_CEILING_MS (30 minutes) here, while the client has
     // already been told the run is over.
     //
-    // Aborting the controller closes the process transport, and that transport's own
-    // escalation then ends the CLI within a bounded few seconds — see the note where
-    // the controller is created. It is the last resort, not the mechanism.
-    // Synchronous, and it cannot throw.
+    // close() tears the subprocess down immediately — the SDK kills the CLI process
+    // group and frees every resource the query holds. Without it the transport's own
+    // escalation after abort() would end the CLI within a bounded few seconds, but
+    // "bounded" still meant waiting out that timer while an ignored stop_task kept
+    // spending. Guarded: it is a last resort layered under the abort below, not a
+    // replacement for it.
+    try {
+      session.instance?.close?.();
+    } catch (closeError) {
+      console.error(`Error closing session process ${sessionId}:`, closeError);
+    }
+
+    // Aborting the controller closes the process transport and releases anything
+    // still parked on it. Synchronous, and it cannot throw.
     session.abortController?.abort();
 
     // Release the held stdin stream as a second exit path — a runtime that
@@ -1826,10 +1986,49 @@ function reconnectSessionWriter(sessionId, newRawWs) {
   return true;
 }
 
+/**
+ * Pushes a queued message into a running session's held stdin stream.
+ *
+ * The CLI's stream-input mode reads the next user message once the current turn
+ * ends, so pushing is the whole of "send this queued message now": the turn
+ * starts the moment the present one finishes, without a dispatcher poll in
+ * between. The run loop counts the owed turn and keeps its terminal `complete`
+ * back until it lands.
+ *
+ * Fails (returns false) when the session has no live held stream — nothing is
+ * running, or it has already started closing — and the caller must leave the
+ * queued message in place for the dispatcher.
+ *
+ * @param {string} sessionId - App session identifier the run was registered under
+ * @param {string} content - Queued message text
+ * @returns {boolean} True when the turn was accepted into the live stream
+ */
+function injectIntoRunningClaudeTurn(sessionId, content) {
+  if (typeof content !== 'string' || !content.trim()) {
+    return false;
+  }
+
+  const handle = sessionId ? heldPromptStreams.get(sessionId) : null;
+  if (!handle) {
+    return false;
+  }
+
+  return handle.push({
+    type: 'user',
+    message: {
+      role: 'user',
+      content
+    },
+    parent_tool_use_id: null,
+    timestamp: new Date().toISOString()
+  });
+}
+
 export const claudeRuntime = {
   run: queryClaudeSDK,
   abort: abortClaudeSDKSession,
   abortSubagent: abortClaudeSubagent,
+  injectIntoRunningTurn: injectIntoRunningClaudeTurn,
   permissions: {
     resolve: resolveToolApproval,
     listPending: getPendingApprovalsForSession,
@@ -1841,6 +2040,7 @@ export {
   queryClaudeSDK,
   abortClaudeSDKSession,
   abortClaudeSubagent,
+  injectIntoRunningClaudeTurn,
   isClaudeSDKSessionActive,
   getActiveClaudeSDKSessions,
   resolveToolApproval,

@@ -108,6 +108,20 @@ export function createProviderRuntimeService(
       return false;
     },
 
+    async injectIntoRunningTurn(sessionId: string, content: string): Promise<boolean> {
+      // Asked of every provider, same reasoning as `abortSubagent`: the run
+      // holding the session may outlive the request's own session row, and
+      // only the runtime that holds the live stdin stream can answer true.
+      for (const provider of dependencies.listProviders()) {
+        const inject = provider.runtime.injectIntoRunningTurn;
+        if (typeof inject === 'function'
+          && await inject.call(provider.runtime, sessionId, content)) {
+          return true;
+        }
+      }
+      return false;
+    },
+
     resolveToolApproval(requestId: string, decision: ProviderPermissionDecision): void {
       for (const provider of dependencies.listProviders()) {
         provider.runtime.permissions?.resolve(requestId, decision);

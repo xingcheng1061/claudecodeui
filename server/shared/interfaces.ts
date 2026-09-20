@@ -44,6 +44,15 @@ export interface IProviderRuntime {
    * unsupported rather than quietly succeeding at nothing.
    */
   abortSubagent?(sessionId: string, toolUseId: string): boolean | Promise<boolean>;
+  /**
+   * Pushes a queued message into a running turn's stdin, so it starts the
+   * moment the present turn ends instead of waiting for the dispatcher.
+   *
+   * Optional, like `abortSubagent`: a provider without a stream-input channel
+   * leaves it out, and the application service reports the request as
+   * unsupported rather than quietly falling back to the queue.
+   */
+  injectIntoRunningTurn?(sessionId: string, content: string): boolean | Promise<boolean>;
   permissions?: ProviderRuntimePermissionGateway;
 }
 

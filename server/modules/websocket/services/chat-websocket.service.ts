@@ -2,7 +2,7 @@ import path from 'node:path';
 
 import type { WebSocket } from 'ws';
 
-import { sessionsDb } from '@/modules/database/index.js';
+import { sessionDraftsDb, sessionsDb } from '@/modules/database/index.js';
 import { providerModelsService, sessionsService } from '@/modules/providers/index.js';
 import { chatRunRegistry } from '@/modules/websocket/services/chat-run-registry.service.js';
 import { connectedClients, WS_OPEN_STATE } from '@/modules/websocket/services/websocket-state.service.js';
@@ -74,6 +74,7 @@ export type ProviderRuntimeGateway = {
   ): Promise<unknown>;
   abort(provider: LLMProvider, sessionId: string): Promise<boolean>;
   abortSubagent(sessionId: string, toolUseId: string): Promise<boolean>;
+  injectIntoRunningTurn(sessionId: string, content: string): Promise<boolean>;
   resolveToolApproval(requestId: string, payload: ProviderPermissionDecision): void;
   getPendingApprovalsForSession(sessionId: string): unknown[];
 };
@@ -487,6 +488,105 @@ async function handleChatSubagentAbort(
 }
 
 /**
+ * Handles `chat.queue.inject`: pushes the session's queued message into the
+ * running turn's stdin, so it starts the moment the present turn ends instead
+ * of waiting for the dispatcher's next poll.
+ *
+ * Only succeeds while a run is actually processing — the message is pushed into
+ * that run's held stdin stream — and only for plain text: stdin carries text,
+ * so a queued message with attachments would lose its files silently, and
+ * losing data is not an acceptable form of expedience.
+ *
+ * Every failure path reports a protocol error and leaves the queue untouched —
+ * the message still goes out the ordinary way when the dispatcher sees the
+ * session idle, which is the failure semantics the queue promises. The claim
+ * happens only after the stream accepted the turn, so a rejected injection can
+ * never consume the message.
+ */
+async function handleChatQueueInject(
+  ws: WebSocket,
+  userId: string | number | null,
+  data: AnyRecord,
+  dependencies: ChatWebSocketDependencies
+): Promise<void> {
+  const sessionId = readRequiredSessionId(data);
+  if (!sessionId) {
+    sendProtocolError(ws, 'SESSION_ID_REQUIRED', 'chat.queue.inject requires a sessionId.');
+    return;
+  }
+
+  if (!chatRunRegistry.isProcessing(sessionId)) {
+    sendProtocolError(
+      ws,
+      'NO_ACTIVE_RUN',
+      `Session "${sessionId}" has no run to inject into.`,
+      sessionId
+    );
+    return;
+  }
+
+  if (userId === null) {
+    sendProtocolError(ws, 'UNAUTHENTICATED', 'chat.queue.inject requires an authenticated user.', sessionId);
+    return;
+  }
+
+  // The queued message belongs to its author: knowing a session id must not
+  // reach another user's queue.
+  const queued = sessionDraftsDb.listQueuedMessages().find((record) =>
+    record.sessionId === sessionId && String(record.userId) === String(userId));
+  if (!queued || !queued.queuedMessage || typeof queued.queuedMessage !== 'object') {
+    sendProtocolError(ws, 'QUEUE_EMPTY', `Session "${sessionId}" has no queued message to inject.`, sessionId);
+    return;
+  }
+
+  const stored = queued.queuedMessage as { content?: unknown; attachments?: unknown };
+  const content = typeof stored.content === 'string' ? stored.content : '';
+  if (!content.trim()) {
+    sendProtocolError(ws, 'QUEUE_EMPTY', 'The queued message has no text to inject.', sessionId);
+    return;
+  }
+
+  if (Array.isArray(stored.attachments) && stored.attachments.length > 0) {
+    sendProtocolError(
+      ws,
+      'QUEUE_INJECT_ATTACHMENTS_UNSUPPORTED',
+      'Queued messages with attachments cannot be injected; stdin carries text only.',
+      sessionId
+    );
+    return;
+  }
+
+  const injected = await dependencies.runtime.injectIntoRunningTurn(sessionId, content);
+  if (!injected) {
+    sendProtocolError(
+      ws,
+      'QUEUE_INJECT_UNSUPPORTED',
+      `No running stream in session "${sessionId}" accepts an injected turn.`,
+      sessionId
+    );
+    return;
+  }
+
+  // Optimistic lock against a dispatcher poll that fired between the read and
+  // the push. Losing it means the dispatcher claimed first; its own run path
+  // owns the message from there, so the queue is left as the dispatcher made it.
+  const claimed = sessionDraftsDb.claimQueuedMessage(queued);
+  if (!claimed) {
+    sendProtocolError(ws, 'QUEUE_CLAIM_LOST', 'The queued message was just claimed by the dispatcher.', sessionId);
+    return;
+  }
+  sessionDraftsDb.deleteEmptyDraft(queued.userId, sessionId);
+
+  // The queue emptied for this session; every open chat socket may be showing
+  // the card (the author certainly is, possibly from more than one tab).
+  for (const connection of connectedClients) {
+    if (connection.readyState === WS_OPEN_STATE) {
+      connection.send(JSON.stringify({ kind: 'queued-updated', sessionId, queued: false }));
+    }
+  }
+}
+
+/**
  * Handles `chat.subscribe`: for each requested session, reports whether a run
  * is processing, re-attaches the live stream to this socket, replays missed
  * events (seq > lastSeq), and includes pending permission requests.
@@ -577,12 +677,13 @@ function handlePermissionResponse(data: AnyRecord, dependencies: ChatWebSocketDe
  * - `chat.send`                { sessionId, content, options? }
  * - `chat.abort`               { sessionId }
  * - `chat.subagent-abort`      { sessionId, toolUseId }
+ * - `chat.queue.inject`        { sessionId }
  * - `chat.subscribe`           { sessions: [{ sessionId, lastSeq? }] }
  * - `chat.permission-response` { requestId, allow, updatedInput?, message?, rememberEntry? }
  *
  * Outbound protocol (server to client): every frame is `kind`-based — either
  * a provider `NormalizedMessage` (with `seq`) or a gateway event
- * (`chat_subscribed`, `session_upserted`, `loading_progress`,
+ * (`chat_subscribed`, `session_upserted`, `loading_progress`, `queued-updated`,
  * `protocol_error`).
  */
 /**
@@ -682,6 +783,9 @@ export function handleChatConnection(
           return;
         case 'chat.subagent-abort':
           await handleChatSubagentAbort(ws, data, dependencies);
+          return;
+        case 'chat.queue.inject':
+          await handleChatQueueInject(ws, userId, data, dependencies);
           return;
         case 'chat.subscribe':
           handleChatSubscribe(ws, data, dependencies);
