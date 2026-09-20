@@ -1,5 +1,5 @@
 import { useTranslation } from 'react-i18next';
-import { memo, useCallback, useEffect, useMemo } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef } from 'react';
 import type { Dispatch, RefObject, SetStateAction } from 'react';
 
 import type { ChatMessage,
@@ -174,8 +174,20 @@ function ChatMessagesPane({
   const subagentFocus = useSubagentFocus();
   const focusedSubagentToolUseId = subagentFocus?.focusedToolUseId ?? null;
   const subagentFocusToken = subagentFocus?.focusToken ?? 0;
+  // One-shot consumption of a focus token: a click mints one, this effect spends
+  // it, and streaming updates after that do not re-scroll. The effect's
+  // dependency on `groupedVisibleMessages` makes it rerun on every flush — one
+  // per stream tick — and without the latch, each rerun dragged the reader back
+  // to the focused card for as long as the focus stayed set. A token that cannot
+  // be spent (the row is not in the loaded window, e.g. its page is still being
+  // fetched) stays pending and lands when the row arrives; clicking the same
+  // card again mints a fresh token, which is what re-scrolls and re-expands.
+  const lastScrolledFocusTokenRef = useRef(0);
   useEffect(() => {
     if (!focusedSubagentToolUseId) {
+      return;
+    }
+    if (subagentFocusToken === lastScrolledFocusTokenRef.current) {
       return;
     }
     const container = scrollContainerRef.current;
@@ -195,6 +207,7 @@ function ChatMessagesPane({
       return;
     }
 
+    lastScrolledFocusTokenRef.current = subagentFocusToken;
     container
       .querySelector(`[data-message-timestamp="${rowMessage.timestamp}"]`)
       ?.scrollIntoView({ block: 'center', behavior: 'smooth' });

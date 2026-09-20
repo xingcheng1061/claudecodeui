@@ -83,7 +83,9 @@ function ChatInterface({
 
   const sessionStore = useSessionStore();
   const streamTimerRef = useRef<number | null>(null);
-  const accumulatedStreamRef = useRef('');
+  // Live answer increments, one bucket per session id — concurrent runs and
+  // subagent traffic must not share a buffer (see useChatRealtimeHandlers).
+  const accumulatedStreamRef = useRef(new Map<string, string>());
   // When each session's `chat.subscribe` was last sent; idle acks older than
   // a later local request are discarded as stale.
   const statusCheckSentAtRef = useRef(new Map<string, number>());
@@ -97,7 +99,7 @@ function ChatInterface({
       clearTimeout(streamTimerRef.current);
       streamTimerRef.current = null;
     }
-    accumulatedStreamRef.current = '';
+    accumulatedStreamRef.current.clear();
   }, []);
 
   const {
@@ -424,6 +426,20 @@ function ChatInterface({
     sendMessage({ type: 'chat.subagent-abort', sessionId: targetSessionId, toolUseId });
   }, [currentSessionId, selectedSession?.id, sendMessage]);
 
+  // "Send now" on the queued card: pushes the message into the running turn's
+  // stdin instead of waiting for the dispatcher. Failures arrive as
+  // protocol_error frames and leave the queue untouched; success is announced
+  // by a `queued-updated` broadcast, which the drafts store turns into the
+  // card's removal.
+  const handleInjectQueuedNow = useCallback(() => {
+    const targetSessionId = currentSessionId || selectedSession?.id || null;
+    if (!targetSessionId) {
+      console.warn('Queue inject requested but no session ID is available.');
+      return;
+    }
+    sendMessage({ type: 'chat.queue.inject', sessionId: targetSessionId });
+  }, [currentSessionId, selectedSession?.id, sendMessage]);
+
   // A composer pick becomes the default for new chats and, when a session is
   // open, is recorded against that session so reopening it restores this model.
   const handleSelectComposerModel = useCallback(async (model: string) => {
@@ -590,6 +606,7 @@ function ChatInterface({
           queuedDraft={queuedDraft}
           onEditQueuedDraft={editQueuedDraft}
           onDeleteQueuedDraft={deleteQueuedDraft}
+          onInjectQueuedNow={handleInjectQueuedNow}
           attachedFiles={attachedFiles}
           onRemoveAttachment={(index) =>
             setAttachedFiles((previous) =>

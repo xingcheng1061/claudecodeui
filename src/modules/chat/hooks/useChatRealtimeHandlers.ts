@@ -2,6 +2,7 @@ import { useEffect, useRef } from 'react';
 import type { Dispatch, MutableRefObject, SetStateAction } from 'react';
 
 import type { ServerEvent,MarkSessionIdle,MarkSessionProcessing,PendingPermissionRequest,ProjectSession,LLMProvider,NormalizedMessage } from '@/shared/types';
+import { hydrateChatDrafts } from '@/shared/chatDrafts';
 import { showCompletionTitleIndicator } from '@/modules/chat/utils/pageTitleNotification';
 import { playChatCompletionSound, playNotificationSound } from '@/shared/utils';
 import type { SessionStore } from '@/modules/chat/hooks/useSessionStore';
@@ -44,18 +45,25 @@ function flushStreamRows({
   sessionId: string | null;
   provider: LLMProvider;
   sessionStore: SessionStore;
-  accumulatedStreamRef: MutableRefObject<string>;
-  accumulatedThinkingRef: MutableRefObject<string>;
+  accumulatedStreamRef: MutableRefObject<Map<string, string>>;
+  accumulatedThinkingRef: MutableRefObject<Map<string, string>>;
 }): void {
-  if (!sessionId) {
-    return;
-  }
+  // `null` flushes every bucket: the shared timer cannot know which session's
+  // increments arrived this tick, and a background session's row must refresh
+  // on the same tick as the viewed one's.
+  const buckets = sessionId
+    ? [sessionId]
+    : [...new Set([...accumulatedStreamRef.current.keys(), ...accumulatedThinkingRef.current.keys()])];
 
-  if (accumulatedStreamRef.current) {
-    sessionStore.updateStreaming(sessionId, accumulatedStreamRef.current, provider);
-  }
-  if (accumulatedThinkingRef.current) {
-    sessionStore.updateStreaming(sessionId, accumulatedThinkingRef.current, provider, 'thinking');
+  for (const bucketSessionId of buckets) {
+    const answer = accumulatedStreamRef.current.get(bucketSessionId);
+    if (answer) {
+      sessionStore.updateStreaming(bucketSessionId, answer, provider);
+    }
+    const thinking = accumulatedThinkingRef.current.get(bucketSessionId);
+    if (thinking) {
+      sessionStore.updateStreaming(bucketSessionId, thinking, provider, 'thinking');
+    }
   }
 }
 
@@ -69,7 +77,13 @@ type UseChatRealtimeHandlersArgs = {
   pendingPermissionRequests: PendingPermissionRequest[];
   setPendingPermissionRequests: Dispatch<SetStateAction<PendingPermissionRequest[]>>;
   streamTimerRef: MutableRefObject<number | null>;
-  accumulatedStreamRef: MutableRefObject<string>;
+  /**
+   * Live answer increments, one bucket per session id. Buckets keep concurrent
+   * runs apart: one shared string let two sessions' deltas (and a subagent's)
+   * interleave into a single row, each flush painting the mixture onto
+   * whichever session happened to trigger it.
+   */
+  accumulatedStreamRef: MutableRefObject<Map<string, string>>;
   /**
    * Highest live `seq` observed per session. Essential for reconnect catch-up:
    * `chat.subscribe` sends this value as `lastSeq` so the server replays only
@@ -126,9 +140,10 @@ export function useChatRealtimeHandlers({
   activeViewSessionIdRef.current = selectedSession?.id || currentSessionId || null;
   const isActiveRef = useRef(isActive);
   isActiveRef.current = isActive;
-  // Reasoning accumulates apart from the answer: same stream, its own row. Local
-  // rather than a prop, because nothing outside this hook reads it.
-  const accumulatedThinkingRef = useRef('');
+  // Reasoning accumulates apart from the answer: same stream, its own row, its
+  // own bucket per session. Local rather than a prop, because nothing outside
+  // this hook reads it.
+  const accumulatedThinkingRef = useRef(new Map<string, string>());
 
   // Keep the latest pending-permission snapshot available to the websocket
   // listener so back-to-back permission events can dedupe and re-arm the
@@ -160,6 +175,16 @@ export function useChatRealtimeHandlers({
         case 'websocket_reconnected':
           onWebSocketReconnect?.();
           return;
+
+        case 'queued-updated': {
+          // The server changed a session's queue (an injected message was
+          // claimed, another device sent one). Re-pull the drafts so the
+          // composer's queued card agrees with the server in the same frame —
+          // the card's own 5s poll would get there eventually, but an explicit
+          // user action deserves immediate feedback.
+          void hydrateChatDrafts();
+          return;
+        }
 
         case 'history_truncated': {
           // An already-sent message was replaced. Every client watching this
@@ -234,58 +259,57 @@ export function useChatRealtimeHandlers({
       /* -------------------------------------------------------------- */
 
       // --- Streaming: buffer for performance ---
-      if (msg.kind === 'thinking_delta') {
+      if (msg.kind === 'thinking_delta' || msg.kind === 'stream_delta') {
         const text = (msg.content as string) || '';
-        if (!text) return;
-        accumulatedThinkingRef.current += text;
-        if (!streamTimerRef.current) {
-          streamTimerRef.current = window.setTimeout(() => {
-            streamTimerRef.current = null;
-            flushStreamRows({ sessionId: sid, provider, sessionStore, accumulatedStreamRef, accumulatedThinkingRef });
-          }, STREAM_FLUSH_MS);
-        }
-        // Also route to store for non-active sessions, exactly as the answer does.
-        // Nothing renders from these rows — a `thinking_delta` is not a drawable
-        // kind — but the answer's are handled the same way, and a session the reader
-        // is not looking at gets its reasoning from the completed block anyway.
-        if (sid && sid !== activeViewSessionId) {
-          sessionStore.appendRealtime(sid, msg as unknown as NormalizedMessage);
-        }
-        return;
-      }
+        // Bucketed strictly by the frame's own session id: a delta with no id
+        // belongs to no row we can name, and writing it to the viewed session
+        // would be the cross-session bleed the buckets exist to prevent.
+        const bucketSessionId = typeof msg.sessionId === 'string' ? msg.sessionId : '';
+        // Subagent partials are never rendered: the folding loop in
+        // useChatMessages skips every row carrying the parent stamp, and the
+        // live display comes from the forwarded complete blocks. Buffering
+        // them would interleave an agent's words into the main thread's row.
+        if (!text || !bucketSessionId || msg.parentToolUseId) return;
 
-      if (msg.kind === 'stream_delta') {
-        const text = (msg.content as string) || '';
-        if (!text) return;
-        accumulatedStreamRef.current += text;
+        const bucket = msg.kind === 'thinking_delta'
+          ? accumulatedThinkingRef.current
+          : accumulatedStreamRef.current;
+        bucket.set(bucketSessionId, (bucket.get(bucketSessionId) ?? '') + text);
         if (!streamTimerRef.current) {
           streamTimerRef.current = window.setTimeout(() => {
             streamTimerRef.current = null;
-            flushStreamRows({ sessionId: sid, provider, sessionStore, accumulatedStreamRef, accumulatedThinkingRef });
+            // Flush every bucket: whichever session's increments arrived this
+            // tick, the others' rows must not wait for their next delta.
+            flushStreamRows({ sessionId: null, provider, sessionStore, accumulatedStreamRef, accumulatedThinkingRef });
           }, STREAM_FLUSH_MS);
-        }
-        // Also route to store for non-active sessions
-        if (sid && sid !== activeViewSessionId) {
-          sessionStore.appendRealtime(sid, msg as unknown as NormalizedMessage);
         }
         return;
       }
 
       if (msg.kind === 'stream_end') {
-        if (streamTimerRef.current) {
+        // Only this session's rows end: a subagent's block stopping must not cut
+        // the main thread's stream short, and another session's must not cut
+        // this one's.
+        const bucketSessionId = typeof msg.sessionId === 'string' ? msg.sessionId : '';
+        if (!bucketSessionId || msg.parentToolUseId) {
+          return;
+        }
+        flushStreamRows({ sessionId: bucketSessionId, provider, sessionStore, accumulatedStreamRef, accumulatedThinkingRef });
+        // Renames both rows, so the next turn's increments start a new one instead
+        // of rewriting this turn's. Called even when nothing was buffered: a row
+        // left over from an interrupted stream is still a row.
+        sessionStore.finalizeStreaming(bucketSessionId);
+        sessionStore.finalizeStreaming(bucketSessionId, 'thinking');
+        accumulatedStreamRef.current.delete(bucketSessionId);
+        accumulatedThinkingRef.current.delete(bucketSessionId);
+        // The single timer flushes every bucket; retire it only when no other
+        // session still has increments pending.
+        if (accumulatedStreamRef.current.size === 0
+          && accumulatedThinkingRef.current.size === 0
+          && streamTimerRef.current) {
           clearTimeout(streamTimerRef.current);
           streamTimerRef.current = null;
         }
-        flushStreamRows({ sessionId: sid, provider, sessionStore, accumulatedStreamRef, accumulatedThinkingRef });
-        if (sid) {
-          // Renames both rows, so the next turn's increments start a new one instead
-          // of rewriting this turn's. Called even when nothing was buffered: a row
-          // left over from an interrupted stream is still a row.
-          sessionStore.finalizeStreaming(sid);
-          sessionStore.finalizeStreaming(sid, 'thinking');
-        }
-        accumulatedStreamRef.current = '';
-        accumulatedThinkingRef.current = '';
         return;
       }
 
@@ -304,23 +328,21 @@ export function useChatRealtimeHandlers({
       // --- UI side effects for specific kinds ---
       switch (msg.kind) {
         case 'complete': {
-          // Flush any remaining streaming state
-          if (streamTimerRef.current) {
+          // Flush any remaining streaming state — this session's rows only;
+          // other sessions' buckets are theirs to finish.
+          if (sid) {
+            flushStreamRows({ sessionId: sid, provider, sessionStore, accumulatedStreamRef, accumulatedThinkingRef });
+            sessionStore.finalizeStreaming(sid);
+            sessionStore.finalizeStreaming(sid, 'thinking');
+            accumulatedStreamRef.current.delete(sid);
+            accumulatedThinkingRef.current.delete(sid);
+          }
+          if (accumulatedStreamRef.current.size === 0
+            && accumulatedThinkingRef.current.size === 0
+            && streamTimerRef.current) {
             clearTimeout(streamTimerRef.current);
             streamTimerRef.current = null;
           }
-          if (sid) {
-            if (accumulatedStreamRef.current) {
-              sessionStore.updateStreaming(sid, accumulatedStreamRef.current, provider);
-              sessionStore.finalizeStreaming(sid);
-            }
-            if (accumulatedThinkingRef.current) {
-              sessionStore.updateStreaming(sid, accumulatedThinkingRef.current, provider, 'thinking');
-              sessionStore.finalizeStreaming(sid, 'thinking');
-            }
-          }
-          accumulatedStreamRef.current = '';
-          accumulatedThinkingRef.current = '';
 
           // `complete` is the unified terminal event — every provider run ends
           // with exactly one, regardless of success, failure, or abort. The

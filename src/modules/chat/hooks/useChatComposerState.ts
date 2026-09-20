@@ -925,6 +925,27 @@ export function useChatComposerState({
     };
   }, [queuedDraft, sessionKey]);
 
+  // Immediate queue reconciliation when the drafts store changes: the 5s poll
+  // above would eventually notice a consumed queue, but an explicit user action
+  // (the inject button, or the same send from another tab) deserves same-frame
+  // feedback. Clears only — populating a card is the restore/hydrate paths' job
+  // — and never crosses a session switch, for the same reason the persistence
+  // effect guards on `queuedDraftSessionRef`.
+  useEffect(() => {
+    if (!sessionKey) {
+      return;
+    }
+    const reconcileNow = () => {
+      if (queuedDraftSessionRef.current !== sessionKey) {
+        return;
+      }
+      if (!readQueuedMessage(sessionKey)) {
+        setQueuedDraft((current) => (current ? null : current));
+      }
+    };
+    return subscribeToChatDrafts(reconcileNow);
+  }, [sessionKey]);
+
   const editQueuedDraft = useCallback(() => {
     if (!queuedDraft) {
       return;

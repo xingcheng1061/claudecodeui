@@ -1,5 +1,5 @@
 import { memo, useMemo, useState } from 'react';
-import { Bot, ChevronRight, CircleStop } from 'lucide-react';
+import { Bot, ChevronRight, CircleStop, Crosshair } from 'lucide-react';
 
 import type { ChatMessage, SubagentActivity, SubagentInfo } from '@/shared/types';
 import { cn } from '@/shared/utils';
@@ -28,8 +28,8 @@ type SubagentsPanelProps = {
   onLoadActivity?: (agentId: string) => void;
   /**
    * Loads the session's full history, for a jump whose card is not in the loaded window.
-   * Without it, clicking a row whose spawn row is on an unloaded page is a silent no-op —
-   * that row does not exist in the client at all, so there is nothing to scroll to.
+   * Without it, jumping from a row whose spawn row is on an unloaded page is a silent
+   * no-op — that row does not exist in the client at all, so there is nothing to scroll to.
    */
   onLoadMissingCard?: () => void;
   /**
@@ -72,12 +72,24 @@ const describeActivity = (item: SubagentActivity): { kind: string; detail: strin
 };
 
 /**
+ * How each timeline entry is dressed: a small kind chip, then the content. Kept
+ * to three tints — reading an agent's timeline should be scanning, not admiring.
+ */
+const ACTIVITY_KIND_PRESENTATION: Record<string, { label: string; chip: string }> = {
+  tool: { label: 'tool', chip: 'bg-sky-500/10 text-sky-600 dark:text-sky-300' },
+  thinking: { label: 'think', chip: 'bg-purple-500/10 text-purple-600 dark:text-purple-300' },
+  text: { label: 'text', chip: 'bg-muted text-muted-foreground' },
+};
+
+/**
  * One row per subagent in the viewed session, pinned above the composer.
  *
  * The transcript already draws a card per agent, but only in place: reaching one
  * means scrolling back to the turn that spawned it, and a long transcript hides
  * it behind lazy rows. This list is an always-reachable index over the same
- * data: opening a row brings that agent's card into view and expands it.
+ * data: opening a row reads the agent's timeline in place, and the crosshair at
+ * the row's right jumps to the agent's card in the transcript — kept apart, so
+ * reading a timeline never costs a scroll and a scroll is never an accident.
  *
  * Rendered by chat's ChatInterface.
  */
@@ -215,33 +227,29 @@ export const SubagentsPanel = memo(({
               ?? entry.foldedActivity;
 
             return (
-              // A row is not a single button: it holds a focus target, an open control, and,
-              // while the agent is running, a stop control. Nesting them would be invalid
-              // markup and would let one mis-click stop an agent instead of opening it.
+              // A row is not a single button: it holds an open control, a jump
+              // target, and, while the agent is running, a stop control.
+              // Nesting them would be invalid markup and would let one
+              // mis-click stop an agent instead of opening it. Opening is what
+              // the row body does — jumping is a deliberate, separately placed
+              // act, so reading a timeline never costs a scroll.
               <div
                 key={toolUseId}
-                className="rounded transition-colors hover:bg-accent/60"
+                className="rounded-md transition-colors hover:bg-accent/60"
               >
-                <div className="flex items-center gap-1">
+                <div className="flex items-center gap-0.5">
                   <button
                     type="button"
-                    onClick={() => {
-                      focus?.focusSubagent(toolUseId);
-                      // A jump whose card is not in the loaded window is otherwise a silent
-                      // no-op: that row does not exist in the client at all, so there is
-                      // nothing to scroll to. Ask for the whole transcript; the focus effect
-                      // in the transcript pane scrolls once the row arrives.
-                      if (!liveByToolUseId.has(toolUseId)) {
-                        onLoadMissingCard?.();
-                      }
-                    }}
+                    aria-expanded={isExpanded}
+                    onClick={() => toggleRow(entry)}
                     title={info.description || info.type || 'Subagent'}
-                    className="flex min-w-0 flex-1 items-center gap-2 py-1.5 text-left text-sm"
+                    className="flex min-w-0 flex-1 items-center gap-2 py-1.5 pl-1.5 pr-1 text-left text-sm"
                   >
+                    <ChevronRight className={cn('h-3.5 w-3.5 flex-shrink-0 text-muted-foreground/50 transition-transform duration-150', isExpanded && 'rotate-90')} />
                     {active ? (
-                      <span className="ml-0.5 h-2 w-2 flex-shrink-0 animate-pulse rounded-full bg-purple-500 dark:bg-purple-400" />
+                      <span className="h-2 w-2 flex-shrink-0 animate-pulse rounded-full bg-purple-500 dark:bg-purple-400" />
                     ) : (
-                      <presentation.Icon className={cn('ml-0.5 h-3.5 w-3.5 flex-shrink-0', presentation.className)} />
+                      <presentation.Icon className={cn('h-3.5 w-3.5 flex-shrink-0', presentation.className)} />
                     )}
                     <span className="flex-shrink-0 font-medium text-foreground">{info.type || 'Agent'}</span>
                     {info.description && (
@@ -254,13 +262,21 @@ export const SubagentsPanel = memo(({
 
                   <button
                     type="button"
-                    aria-expanded={isExpanded}
-                    onClick={() => toggleRow(entry)}
-                    title={isExpanded ? 'Hide what this agent did' : 'Show what this agent did'}
-                    aria-label={isExpanded ? 'Hide what this agent did' : 'Show what this agent did'}
-                    className="flex h-7 w-7 flex-shrink-0 items-center justify-center rounded text-muted-foreground/60 transition-colors hover:bg-accent hover:text-foreground"
+                    onClick={() => {
+                      focus?.focusSubagent(toolUseId);
+                      // A jump whose card is not in the loaded window is otherwise a silent
+                      // no-op: that row does not exist in the client at all, so there is
+                      // nothing to scroll to. Ask for the whole transcript; the focus effect
+                      // in the transcript pane scrolls once the row arrives.
+                      if (!liveByToolUseId.has(toolUseId)) {
+                        onLoadMissingCard?.();
+                      }
+                    }}
+                    title="Jump to this agent's card in the transcript"
+                    aria-label="Jump to this agent's card in the transcript"
+                    className="flex h-7 w-7 flex-shrink-0 items-center justify-center rounded text-muted-foreground/50 transition-colors hover:bg-accent hover:text-foreground"
                   >
-                    <ChevronRight className={cn('h-4 w-4 transition-transform duration-150', isExpanded && 'rotate-90')} />
+                    <Crosshair className="h-3.5 w-3.5" />
                   </button>
 
                   {canStop && (
@@ -277,37 +293,48 @@ export const SubagentsPanel = memo(({
                 </div>
 
                 {isExpanded && (
-                  <div className="pb-2 pl-7 pr-1 text-xs">
-                    {isLoading ? (
-                      <p className="text-muted-foreground/70">Loading transcript…</p>
-                    ) : activity.length > 0 ? (
-                      <ol className="space-y-1.5">
-                        {activity.map((item, index) => {
-                          const { kind, detail } = describeActivity(item);
-                          return (
-                            <li key={`${toolUseId}-${index}`} className="flex gap-2">
-                              <span className="w-14 flex-shrink-0 pt-0.5 text-[10px] uppercase tracking-wide text-muted-foreground/60">
-                                {kind}
-                              </span>
-                              <span
-                                className={cn(
-                                  'min-w-0 flex-1',
-                                  kind === 'tool'
-                                    ? 'truncate font-mono text-[11px] text-muted-foreground'
-                                    : 'whitespace-pre-wrap text-muted-foreground',
-                                  kind === 'thinking' && 'italic text-muted-foreground/80',
-                                )}
-                                title={kind === 'tool' ? detail : undefined}
-                              >
-                                {detail}
-                              </span>
-                            </li>
-                          );
-                        })}
-                      </ol>
-                    ) : (
-                      <p className="text-muted-foreground/70">No transcript for this agent.</p>
-                    )}
+                  <div className="mb-1.5 ml-6 mr-1 overflow-hidden rounded-lg border border-border/40 bg-muted/30">
+                    <div className="max-h-56 overflow-y-auto">
+                      {isLoading ? (
+                        <p className="px-3 py-2.5 text-xs text-muted-foreground/70">Loading transcript…</p>
+                      ) : activity.length > 0 ? (
+                        <ol className="divide-y divide-border/30">
+                          {activity.map((item, index) => {
+                            const { kind, detail } = describeActivity(item);
+                            const presentation = ACTIVITY_KIND_PRESENTATION[kind]
+                              ?? ACTIVITY_KIND_PRESENTATION.text;
+                            return (
+                              <li key={`${toolUseId}-${index}`} className="flex items-start gap-2 px-2.5 py-1.5">
+                                <span
+                                  className={cn(
+                                    'mt-0.5 flex-shrink-0 rounded px-1.5 py-0.5 text-[9px] font-medium uppercase tracking-wide',
+                                    presentation.chip,
+                                  )}
+                                >
+                                  {presentation.label}
+                                </span>
+                                <span
+                                  className={cn(
+                                    'min-w-0 flex-1 leading-relaxed',
+                                    kind === 'tool'
+                                      ? 'truncate font-mono text-[11px] text-muted-foreground'
+                                      : 'whitespace-pre-wrap text-xs text-foreground/85',
+                                    kind === 'thinking' && 'italic text-muted-foreground',
+                                  )}
+                                  title={kind === 'tool' ? detail : undefined}
+                                >
+                                  {detail}
+                                </span>
+                              </li>
+                            );
+                          })}
+                        </ol>
+                      ) : (
+                        <p className="px-3 py-2.5 text-xs italic text-muted-foreground/60">
+                          No transcript for this agent yet.
+                        </p>
+                      )}
+                    </div>
                   </div>
                 )}
               </div>

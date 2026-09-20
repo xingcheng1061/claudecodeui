@@ -34,7 +34,7 @@ const renderHandlers = () => {
       pending = typeof next === 'function' ? next(pending) : next;
     },
     streamTimerRef: { current: null },
-    accumulatedStreamRef: { current: '' },
+    accumulatedStreamRef: { current: new Map<string, string>() },
     lastSeqRef: { current: new Map() },
     statusCheckSentAtRef: { current: new Map() },
     requestLatestMessages: async () => {},
