@@ -89,7 +89,7 @@ function readResultText(content: unknown): string {
  */
 const SUBAGENT_NOTE_MARKDOWN_CLASS = 'prose prose-sm prose-gray max-w-none font-serif dark:prose-invert';
 
-const SubagentNote = memo(({ activity }: { activity: SubagentActivity }) => {
+export const SubagentNote = memo(({ activity }: { activity: SubagentActivity }) => {
   const isThinking = activity.kind === 'thinking';
   const Icon = isThinking ? Brain : MessageSquareText;
 

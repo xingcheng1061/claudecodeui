@@ -1,12 +1,30 @@
-import { memo, useMemo, useState } from 'react';
+import { memo, useMemo, useRef, useState } from 'react';
+import type { PointerEvent as ReactPointerEvent } from 'react';
 import { Bot, ChevronRight, CircleStop, Crosshair } from 'lucide-react';
 
-import type { ChatMessage, SubagentActivity, SubagentInfo } from '@/shared/types';
+import type { ChatMessage, DiffLine, Project, SubagentActivity, SubagentInfo } from '@/shared/types';
 import { cn } from '@/shared/utils';
+import { ToolRenderer } from '@/modules/chat/tools/ToolRenderer';
+import { SubagentNote } from '@/modules/chat/tools/SubagentPanel';
 import { formatSubagentUsageLabel } from '@/modules/chat/utils/chatFormatting';
 import { useSubagentFocus } from '@/modules/chat/context/SubagentFocusContext';
 import { mergeSubagentState } from '@/modules/chat/hooks/useChatMessages';
 import { SUBAGENT_STATUS_PRESENTATION, isSubagentActive } from '@/modules/chat/subagents/subagentStatus';
+
+/** How many timeline entries render before the per-row "show more" step — the same cap the card uses. */
+const INITIALLY_RENDERED_ACTIVITIES = 25;
+const SHOW_MORE_STEP = 50;
+
+/* Panel height: user-resizable by dragging the top edge, remembered across visits. */
+const PANEL_HEIGHT_STORAGE_KEY = 'subagents-panel-height';
+const DEFAULT_PANEL_HEIGHT = 256; // px — the historical max-h-64
+const MIN_PANEL_HEIGHT = 160;
+const MAX_PANEL_HEIGHT_RATIO = 0.8; // of the viewport
+
+const readStoredPanelHeight = (): number => {
+  const saved = Number(window.localStorage.getItem(PANEL_HEIGHT_STORAGE_KEY));
+  return Number.isFinite(saved) && saved >= MIN_PANEL_HEIGHT ? saved : DEFAULT_PANEL_HEIGHT;
+};
 
 type SubagentsPanelProps = {
   /**
@@ -38,6 +56,10 @@ type SubagentsPanelProps = {
    * agents. Absent on a surface with no way to send, which also hides the control.
    */
   onStopSubagent?: (toolUseId: string) => void;
+  /** Threaded to the timeline's tool rows, so a subagent's Bash or diff renders exactly like one the main thread ran. */
+  onFileOpen?: (filePath: string, diffInfo?: unknown) => void;
+  createDiff?: (oldStr: string, newStr: string) => DiffLine[];
+  selectedProject?: Project | null;
 };
 
 type SubagentEntry = {
@@ -71,33 +93,6 @@ const readTaskPrompt = (toolInput: unknown): string => {
 };
 
 /**
- * One line per activity entry.
- *
- * The panel is an index over the agents, not a second renderer for them: the transcript's
- * card is where an agent's work is drawn in full, and this is what a reader consults to find
- * out what an agent did without hunting for that card.
- */
-const describeActivity = (item: SubagentActivity): { kind: string; detail: string } => {
-  if (item.kind === 'tool') {
-    const input = typeof item.toolInput === 'string' ? item.toolInput : JSON.stringify(item.toolInput ?? '');
-    const detail = input && input !== '{}' ? `${item.toolName ?? 'Tool'} · ${input}` : item.toolName ?? 'Tool';
-    return { kind: 'tool', detail };
-  }
-
-  return { kind: item.kind, detail: item.content ?? '' };
-};
-
-/**
- * How each timeline entry is dressed: a small kind chip, then the content. Kept
- * to three tints — reading an agent's timeline should be scanning, not admiring.
- */
-const ACTIVITY_KIND_PRESENTATION: Record<string, { label: string; chip: string }> = {
-  tool: { label: 'tool', chip: 'bg-sky-500/10 text-sky-600 dark:text-sky-300' },
-  thinking: { label: 'think', chip: 'bg-purple-500/10 text-purple-600 dark:text-purple-300' },
-  text: { label: 'text', chip: 'bg-muted text-muted-foreground' },
-};
-
-/**
  * One row per subagent in the viewed session, pinned above the composer.
  *
  * The transcript already draws a card per agent, but only in place: reaching one
@@ -117,6 +112,9 @@ export const SubagentsPanel = memo(({
   onLoadActivity,
   onLoadMissingCard,
   onStopSubagent,
+  onFileOpen,
+  createDiff,
+  selectedProject,
 }: SubagentsPanelProps) => {
   const focus = useSubagentFocus();
 
@@ -192,6 +190,48 @@ export const SubagentsPanel = memo(({
   // Per row, and only the rows that were opened: an agent's timeline is the largest read
   // the backend offers, and most visits are to the list.
   const [expandedRows, setExpandedRows] = useState<string[]>([]);
+  // Per row render cap, same mechanism as the card: a tool entry can expand into a
+  // diff viewer, so an agent with a long run must not mount its whole history at once.
+  const [renderLimits, setRenderLimits] = useState<Record<string, number>>({});
+
+  // Drag-to-resize. The list container takes `maxHeight` (not a fixed height), so a
+  // panel whose content is shorter than the cap still hugs it — dragging only shows
+  // once there is something to reveal, which is the case that matters.
+  const [panelHeight, setPanelHeight] = useState<number>(readStoredPanelHeight);
+  const resizeStateRef = useRef<{ startY: number; startHeight: number } | null>(null);
+
+  const onResizeStart = (event: ReactPointerEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    resizeStateRef.current = { startY: event.clientY, startHeight: panelHeight };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+
+  const onResizeMove = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const state = resizeStateRef.current;
+    if (!state) {
+      return;
+    }
+    const maxHeight = Math.max(MIN_PANEL_HEIGHT, Math.floor(window.innerHeight * MAX_PANEL_HEIGHT_RATIO));
+    const next = state.startHeight - (event.clientY - state.startY);
+    setPanelHeight(Math.min(maxHeight, Math.max(MIN_PANEL_HEIGHT, next)));
+  };
+
+  const onResizeEnd = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!resizeStateRef.current) {
+      return;
+    }
+    resizeStateRef.current = null;
+    event.currentTarget.releasePointerCapture(event.pointerId);
+    setPanelHeight((height) => {
+      window.localStorage.setItem(PANEL_HEIGHT_STORAGE_KEY, String(height));
+      return height;
+    });
+  };
+
+  const resetPanelHeight = () => {
+    setPanelHeight(DEFAULT_PANEL_HEIGHT);
+    window.localStorage.setItem(PANEL_HEIGHT_STORAGE_KEY, String(DEFAULT_PANEL_HEIGHT));
+  };
 
   if (entries.length === 0) {
     return null;
@@ -208,7 +248,17 @@ export const SubagentsPanel = memo(({
   };
 
   return (
-    <div className="border-t border-border/50">
+    <div className="flex-shrink-0 border-t border-border/50">
+      {/* Resize grip: drag to raise or lower the list, double-click to reset. Pointer
+          capture keeps the drag alive when the cursor leaves the bar. */}
+      <div
+        onPointerDown={onResizeStart}
+        onPointerMove={onResizeMove}
+        onPointerUp={onResizeEnd}
+        onDoubleClick={resetPanelHeight}
+        title="Drag to resize · double-click to reset"
+        className="h-1.5 cursor-row-resize touch-none transition-colors hover:bg-primary/25"
+      />
       <button
         type="button"
         aria-expanded={isOpen}
@@ -229,7 +279,7 @@ export const SubagentsPanel = memo(({
       </button>
 
       {isOpen && (
-        <div className="max-h-64 overflow-y-auto px-4 pb-2">
+        <div className="overflow-y-auto px-4 pb-2" style={{ height: panelHeight }}>
           {entries.map((entry) => {
             const { toolUseId, info, transcriptId } = entry;
             const presentation = SUBAGENT_STATUS_PRESENTATION[info.status];
@@ -325,43 +375,50 @@ export const SubagentsPanel = memo(({
                         </div>
                       </div>
                     )}
-                    <div className="max-h-56 overflow-y-auto">
+                    {/* No inner scroll cap on purpose: the resized panel is the one scroll
+                        surface, so dragging it larger reveals more timeline directly. An
+                        inner max-height would fight the panel and cap the view at its own
+                        fixed size no matter how large the panel gets. */}
+                    <div className="px-2 py-1.5">
                       {isLoading ? (
-                        <p className="px-3 py-2.5 text-xs text-muted-foreground/70">Loading transcript…</p>
+                        <p className="px-1 py-1.5 text-xs text-muted-foreground/70">Loading transcript…</p>
                       ) : activity.length > 0 ? (
-                        <ol className="divide-y divide-border/30">
-                          {activity.map((item, index) => {
-                            const { kind, detail } = describeActivity(item);
-                            const presentation = ACTIVITY_KIND_PRESENTATION[kind]
-                              ?? ACTIVITY_KIND_PRESENTATION.text;
-                            return (
-                              <li key={`${toolUseId}-${index}`} className="flex items-start gap-2 px-2.5 py-1.5">
-                                <span
-                                  className={cn(
-                                    'mt-0.5 flex-shrink-0 rounded px-1.5 py-0.5 text-[9px] font-medium uppercase tracking-wide',
-                                    presentation.chip,
-                                  )}
-                                >
-                                  {presentation.label}
-                                </span>
-                                <span
-                                  className={cn(
-                                    'min-w-0 flex-1 leading-relaxed',
-                                    kind === 'tool'
-                                      ? 'truncate font-mono text-[11px] text-muted-foreground'
-                                      : 'whitespace-pre-wrap text-xs text-foreground/85',
-                                    kind === 'thinking' && 'italic text-muted-foreground',
-                                  )}
-                                  title={kind === 'tool' ? detail : undefined}
-                                >
-                                  {detail}
-                                </span>
-                              </li>
-                            );
-                          })}
-                        </ol>
+                        <>
+                          <div className="border-l border-border/50 pl-2">
+                            {activity.slice(0, renderLimits[toolUseId] ?? INITIALLY_RENDERED_ACTIVITIES).map((item, index) => (
+                              item.kind === 'tool' ? (
+                                // Same router the card and the main thread use, so a
+                                // subagent's Bash command or diff looks identical here.
+                                <ToolRenderer
+                                  key={item.toolId ?? `${toolUseId}-${index}`}
+                                  toolName={item.toolName || 'UnknownTool'}
+                                  toolInput={item.toolInput}
+                                  toolId={item.toolId}
+                                  mode="input"
+                                  onFileOpen={onFileOpen}
+                                  createDiff={createDiff}
+                                  selectedProject={selectedProject}
+                                />
+                              ) : (
+                                <SubagentNote key={`${toolUseId}-${index}`} activity={item} />
+                              )
+                            ))}
+                          </div>
+                          {activity.length > (renderLimits[toolUseId] ?? INITIALLY_RENDERED_ACTIVITIES) && (
+                            <button
+                              type="button"
+                              onClick={() => setRenderLimits((limits) => ({
+                                ...limits,
+                                [toolUseId]: (limits[toolUseId] ?? INITIALLY_RENDERED_ACTIVITIES) + SHOW_MORE_STEP,
+                              }))}
+                              className="mt-1.5 w-full rounded py-1 text-center text-[11px] text-muted-foreground transition-colors hover:bg-accent/60 hover:text-foreground"
+                            >
+                              Show {Math.min(SHOW_MORE_STEP, activity.length - (renderLimits[toolUseId] ?? INITIALLY_RENDERED_ACTIVITIES))} more of {activity.length}
+                            </button>
+                          )}
+                        </>
                       ) : (
-                        <p className="px-3 py-2.5 text-xs italic text-muted-foreground/60">
+                        <p className="px-1 py-1.5 text-xs italic text-muted-foreground/60">
                           No transcript for this agent yet.
                         </p>
                       )}

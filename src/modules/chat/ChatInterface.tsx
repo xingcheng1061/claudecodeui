@@ -555,6 +555,9 @@ function ChatInterface({
           onLoadActivity={loadSubagentActivity}
           onLoadMissingCard={loadAllMessages}
           onStopSubagent={handleStopSubagent}
+          onFileOpen={onFileOpen}
+          createDiff={createDiff}
+          selectedProject={selectedProject}
         />
 
         <div className="relative flex-shrink-0">
