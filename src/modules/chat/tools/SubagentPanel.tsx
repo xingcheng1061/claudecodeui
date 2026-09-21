@@ -19,7 +19,7 @@ import {
   resolveSubagentStatus,
 } from '@/modules/chat/subagents/subagentStatus';
 import { formatSubagentUsageLabel } from '@/modules/chat/utils/chatFormatting';
-import { MarkdownContent } from '@/modules/chat/tools/ContentRenderers/MarkdownContent';
+import { Markdown } from '@/modules/chat/transcript/Markdown';
 
 type SubagentPanelProps = {
   /** Raw tool input of the call that spawned the agent, used for the prompt. */
@@ -77,7 +77,18 @@ function readResultText(content: unknown): string {
   return text;
 }
 
-/** One prose or reasoning entry from the agent's own narration. */
+/**
+ * One prose or reasoning entry from the agent's own narration.
+ *
+ * Rendered through the same `Markdown` component the main transcript uses, with
+ * the same prose classes — an agent's reply is model-authored markdown like any
+ * other, and drawing it as plain text made every heading, list and code fence
+ * show as raw syntax. The icon is the only thing that still tells the two
+ * narration kinds apart, matching how little the main transcript distinguishes
+ * them inside its own reasoning block.
+ */
+const SUBAGENT_NOTE_MARKDOWN_CLASS = 'prose prose-sm prose-gray max-w-none font-serif dark:prose-invert';
+
 const SubagentNote = memo(({ activity }: { activity: SubagentActivity }) => {
   const isThinking = activity.kind === 'thinking';
   const Icon = isThinking ? Brain : MessageSquareText;
@@ -85,13 +96,10 @@ const SubagentNote = memo(({ activity }: { activity: SubagentActivity }) => {
   return (
     <div className="flex gap-2 py-1">
       <Icon className={cn('mt-0.5 h-3 w-3 flex-shrink-0', isThinking ? 'text-muted-foreground/50' : 'text-muted-foreground/70')} />
-      <div
-        className={cn(
-          'min-w-0 flex-1 whitespace-pre-wrap break-words text-xs leading-relaxed',
-          isThinking ? 'italic text-muted-foreground/70' : 'text-muted-foreground',
-        )}
-      >
-        {activity.content}
+      <div className={cn('min-w-0 flex-1', isThinking ? 'text-muted-foreground/70' : 'text-muted-foreground')}>
+        <Markdown className={SUBAGENT_NOTE_MARKDOWN_CLASS}>
+          {activity.content ?? ''}
+        </Markdown>
       </div>
     </div>
   );
@@ -269,7 +277,9 @@ export const SubagentPanel = memo(({
           {resultText && (
             <div className="rounded border border-border/40 bg-muted/30 p-2">
               <div className="mb-1 text-[10px] uppercase tracking-wide text-muted-foreground/60">Result</div>
-              <MarkdownContent content={resultText} className="prose prose-sm max-w-none dark:prose-invert" />
+              <Markdown className="prose prose-sm prose-gray max-w-none font-serif dark:prose-invert">
+                {resultText}
+              </Markdown>
             </div>
           )}
         </div>

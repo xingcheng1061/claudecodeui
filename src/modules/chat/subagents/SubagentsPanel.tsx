@@ -52,6 +52,22 @@ type SubagentEntry = {
   transcriptId: string | null;
   /** What the transcript fold already knows, shown until, or instead of, a full read. */
   foldedActivity: SubagentActivity[];
+  /** What the main agent asked this one to do — from the spawn row's input or the list endpoint. */
+  prompt: string | null;
+};
+
+/** Reads the task prompt off a spawn row's tool input (object or JSON string). */
+const readTaskPrompt = (toolInput: unknown): string => {
+  const parsed = typeof toolInput === 'string'
+    ? (() => {
+      try {
+        return JSON.parse(toolInput) as Record<string, unknown>;
+      } catch {
+        return {};
+      }
+    })()
+    : ((toolInput ?? {}) as Record<string, unknown>);
+  return typeof parsed.prompt === 'string' ? parsed.prompt : '';
 };
 
 /**
@@ -122,6 +138,9 @@ export const SubagentsPanel = memo(({
         info,
         transcriptId: null,
         foldedActivity: message.subagentActivity ?? [],
+        // The spawn row is in the loaded window, so its tool input — and with it
+        // the prompt the main agent issued — is readable right here.
+        prompt: readTaskPrompt(message.toolInput) || null,
       });
     }
     return map;
@@ -148,6 +167,7 @@ export const SubagentsPanel = memo(({
         info: mergeSubagentState(info, live?.info) ?? info,
         transcriptId: info.id,
         foldedActivity: live?.foldedActivity ?? [],
+        prompt: info.prompt ?? live?.prompt ?? null,
       });
     }
 
@@ -294,6 +314,17 @@ export const SubagentsPanel = memo(({
 
                 {isExpanded && (
                   <div className="mb-1.5 ml-6 mr-1 overflow-hidden rounded-lg border border-border/40 bg-muted/30">
+                    {entry.prompt && (
+                      <div className="border-b border-border/30 bg-background/40 px-2.5 py-1.5">
+                        <div className="mb-0.5 text-[9px] font-medium uppercase tracking-wide text-muted-foreground/60">Task</div>
+                        <div
+                          className="line-clamp-4 whitespace-pre-wrap break-words text-xs text-foreground/85"
+                          title={entry.prompt}
+                        >
+                          {entry.prompt}
+                        </div>
+                      </div>
+                    )}
                     <div className="max-h-56 overflow-y-auto">
                       {isLoading ? (
                         <p className="px-3 py-2.5 text-xs text-muted-foreground/70">Loading transcript…</p>

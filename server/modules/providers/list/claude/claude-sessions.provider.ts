@@ -669,6 +669,10 @@ async function getSessionMessages(
             ?? (typeof message.toolUseResult?.description === 'string' ? message.toolUseResult.description : undefined),
           model: subagent.info.model
             ?? (typeof message.toolUseResult?.resolvedModel === 'string' ? message.toolUseResult.resolvedModel : undefined),
+          // The spawn row is the only place the agent's own prompt is recorded;
+          // the agent's transcript echoes it as a user row the timeline folds
+          // away, and the task events never carry it.
+          prompt: typeof message.toolUseResult?.prompt === 'string' ? message.toolUseResult.prompt : undefined,
           status: isAwaitingAsyncAgent ? 'running' : terminalStatus,
         };
       }

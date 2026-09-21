@@ -295,6 +295,8 @@ export type SubagentInfo = {
   name?: string;
   type?: string;
   description?: string;
+  /** The prompt the spawning agent issued, from the spawn row's toolUseResult. */
+  prompt?: string;
   status: SubagentStatus;
   model?: string;
   /** Total entries the agent recorded, which exceeds the received timeline when a long run was truncated for transport. */

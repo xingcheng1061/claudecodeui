@@ -442,6 +442,8 @@ export type SubagentInfo = {
   type?: string;
   /** One-line task summary shown in the collapsed header. */
   description?: string;
+  /** The prompt the spawning agent issued, from the spawn row's toolUseResult. */
+  prompt?: string;
   status: SubagentStatus;
   /** Model the subagent ran on, when the provider records it. */
   model?: string;
