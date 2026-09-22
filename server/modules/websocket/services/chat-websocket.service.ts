@@ -159,15 +159,26 @@ async function handleChatSend(
 
   const result = await dispatchRun(ws, userId, resolved.sessionId, resolved.session, data, dependencies);
 
-  // Locked out by a process still held open for background work. The client
-  // believed the session idle (its run had already reported complete), so it
-  // sent a plain chat.send rather than queueing — queue on its behalf so the
-  // turn is not lost. The dispatcher delivers it the moment the process
-  // exits, and the `queued-updated` broadcast makes the queued card appear
-  // without waiting for the composer's poll.
+  // Locked out by a process still held open for background work. The main
+  // agent is idle in that state, so a plain-text turn goes straight into the
+  // live stream and starts the moment the current work reports back — faster
+  // than the queue, same single writer. Only a turn the stream cannot take
+  // (attachments, or the process already closing) falls back to the queue.
   if (result.error === HELD_OPEN_BUSY_ERROR) {
-    queueTurnOnAuthorBehalf(ws, userId, resolved.sessionId, data, dependencies);
+    const content = typeof data.content === 'string' ? data.content : '';
+    if (!content.trim() || !turnPayloadHasAttachments(data)
+      || !await dependencies.runtime.injectIntoRunningTurn?.(resolved.sessionId, content)) {
+      queueTurnOnAuthorBehalf(ws, userId, resolved.sessionId, data, dependencies);
+    }
   }
+}
+
+/** True when the turn's options carry any attachment arrays. */
+function turnPayloadHasAttachments(data: AnyRecord): boolean {
+  const options = data.options && typeof data.options === 'object' && !Array.isArray(data.options)
+    ? data.options as Record<string, unknown>
+    : {};
+  return ['images', 'files', 'attachments'].some((key) => Array.isArray(options[key]) && options[key].length > 0);
 }
 
 /**

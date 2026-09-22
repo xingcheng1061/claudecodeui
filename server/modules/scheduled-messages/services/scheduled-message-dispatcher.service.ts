@@ -62,26 +62,47 @@ async function sendClaimedQueuedMessage(
     return;
   }
 
-  const result = await runDetachedChatTurn(
-    {
-      sessionId: candidate.sessionId,
-      userId: candidate.userId,
-      content: message.content,
-      options: { ...message.options, attachments: message.attachments },
-    },
-    { runtime },
-  );
+  try {
+    const result = await runDetachedChatTurn(
+      {
+        sessionId: candidate.sessionId,
+        userId: candidate.userId,
+        content: message.content,
+        options: { ...message.options, attachments: message.attachments },
+      },
+      { runtime },
+    );
 
-  // The registry check and run reservation are separate operations. If a run
-  // wins that tiny race, put the turn back so the next poll tries again. The
-  // held-open refusal is the same story on a longer clock: a background
-  // agent's process is still finishing, and the turn retries when it exits.
-  if (!result.started && (result.error === 'A run was already in progress for this session.'
-    || result.error === HELD_OPEN_BUSY_ERROR)) {
+    // The registry check and run reservation are separate operations. If a run
+    // wins that tiny race, put the turn back so the next poll tries again.
+    if (!result.started && result.error === 'A run was already in progress for this session.') {
+      sessionDraftsDb.restoreQueuedMessage(candidate);
+      return;
+    }
+
+    // Held-open refusal: a background agent's process is still alive, but its
+    // main agent is idle. A text-only turn starts right there in the same
+    // process instead of waiting out the background work — the wait is
+    // unbounded in practice, because the hold's ceiling re-arms on every
+    // stream event. Attachments need the ordinary dispatch path, so they keep
+    // waiting for the process to exit.
+    if (!result.started && result.error === HELD_OPEN_BUSY_ERROR) {
+      if (message.attachments.length === 0
+        && await runtime.injectIntoRunningTurn(candidate.sessionId, message.content)) {
+        sessionDraftsDb.deleteEmptyDraft(candidate.userId, candidate.sessionId);
+        return;
+      }
+      sessionDraftsDb.restoreQueuedMessage(candidate);
+      return;
+    }
+
+    sessionDraftsDb.deleteEmptyDraft(candidate.userId, candidate.sessionId);
+  } catch (error) {
+    // A claimed message must never vanish on an unexpected dispatch error:
+    // the claim already emptied its slot, so put it back for the next poll.
+    console.error('Queued message dispatch failed; restoring it for retry:', error);
     sessionDraftsDb.restoreQueuedMessage(candidate);
-    return;
   }
-  sessionDraftsDb.deleteEmptyDraft(candidate.userId, candidate.sessionId);
 }
 
 /** Sends every persisted queued turn whose session is currently idle. */
