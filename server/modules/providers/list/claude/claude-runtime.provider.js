@@ -1458,9 +1458,10 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
   // turn-ending `result` is only mined for usage when nothing better arrived.
   let assistantBudgetSent = false;
   // Injected queued turns and results seen. A run starts expecting exactly one
-  // result — the initial turn's — and every successful push raises that by one;
-  // a `result` with turns still outstanding is intermediate, and the terminal
-  // `complete` waits for the last one.
+  // result — the initial turn's — and every successful push raises that by one.
+  // The difference decides whether the PROCESS is held open for a turn that has
+  // not reported yet; it must never hold back the client's terminal `complete`,
+  // because a push cannot promise that a result will come back at all.
   let injectedTurnCount = 0;
   let resultCount = 0;
 
@@ -1698,6 +1699,13 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
       heldPromptStreams.set(sessionKey(), heldPromptHandle);
     }
 
+    // Silence watchdog backstop: armed from the start and re-armed by every
+    // stream event, so a stream that goes completely quiet — the CLI hung
+    // mid-turn and no `result` will ever arrive — still ends within the
+    // ceiling instead of pinning the client's spinner forever. Activity keeps
+    // pushing it out; only true silence lets it fire.
+    scheduleRelease();
+
     // Process streaming messages
     console.log('Starting async generator loop for session:', capturedSessionId || 'NEW');
     for await (const message of queryInstance) {
@@ -1836,16 +1844,17 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
         textDeltaCount = 0;
         thinkingDeltaCount = 0;
 
-        // A result with turns still owed — a queued message was pushed
-        // mid-turn — is intermediate: the client stays processing and stdin
-        // stays open until the last injected turn lands. Only then does the
-        // terminal `complete` go out.
+        // Turns still owed to pushed messages decide whether the PROCESS stays
+        // up — never whether the client's complete goes out. A push only
+        // promises delivery into the stream's queue, not that the CLI will
+        // read it or answer it; holding the terminal on that turned one
+        // unanswered push into a session that never completes and a client
+        // that spins until the server restarts.
         const abortPending = sessionKey() ? abortedSessionIds.has(sessionKey()) : false;
         const stillOutstanding = backgroundWork.hasOutstanding(sessionKey());
-        const pendingInjectedTurns = !abortPending && injectedTurnCount + 1 - resultCount > 0;
-        if (pendingInjectedTurns) {
-          scheduleRelease();
-        } else if (!turnCompleteSent && !abortPending) {
+        const pendingInjectedTurns = injectedTurnCount + 1 - resultCount > 0;
+
+        if (!turnCompleteSent && !abortPending) {
           turnCompleteSent = true;
           ws.send(createCompleteMessage({ provider: 'claude', sessionId: capturedSessionId || sessionId || null, exitCode: 0 }));
           notifyRunStopped({
@@ -1866,41 +1875,34 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
             sessionName: sessionSummary
           });
         }
-        if (pendingInjectedTurns) {
-          // Hold for the injected turn; the schedule above re-armed the
-          // ceiling. The hold is reported so a later result from a turn with
-          // no outstanding work still releases the process.
-          scheduleRelease();
+        // Keep the process while pushed turns are still owed (their results
+        // arrive as follow-up turns) or background work is outstanding — but
+        // the terminal above has already gone out either way, so a turn that
+        // never answers costs the client nothing but silence it can see
+        // through.
+        //
+        // The release when the last task settles is this same branch on the
+        // follow-up turn the CLI pushes for it, not the settling event
+        // itself: closing stdin at that moment would cut the turn that
+        // relays the task's result.
+        //
+        // When the turn reported its tasks, the tracker is the whole truth: an
+        // Agent call without `run_in_background` is scored as background by
+        // `startsBackgroundWork`, but the CLI runs it in the foreground and
+        // it has settled before this `result` — holding for it kept a process
+        // alive for the full ceiling with nothing outstanding.
+        const holdForTurn = pendingInjectedTurns
+          || (sawTaskEventThisTurn ? stillOutstanding : backgroundWorkPending || stillOutstanding);
+        backgroundWorkPending = false;
+        sawTaskEventThisTurn = false;
+        if (holdForTurn) {
           heldForBackgroundWork = true;
+          scheduleRelease();
         } else {
-          // Work started during this turn, or work from an earlier turn that
-          // has not settled yet (a follow-up turn reports one task in while
-          // another is still going), is still running. Hold the process open
-          // so it can finish and report back in a follow-up turn; the ceiling
-          // is only a backstop for work that never reports.
-          //
-          // The release when the last task settles is this same branch on the
-          // follow-up turn the CLI pushes for it, not the settling event
-          // itself: closing stdin at that moment would cut the turn that
-          // relays the task's result.
-          //
-          // When the turn reported its tasks, the tracker is the whole truth: an
-          // Agent call without `run_in_background` is scored as background by
-          // `startsBackgroundWork`, but the CLI runs it in the foreground and
-          // it has settled before this `result` — holding for it kept a process
-          // alive for the full ceiling with nothing outstanding.
-          const holdForTurn = sawTaskEventThisTurn ? stillOutstanding : backgroundWorkPending || stillOutstanding;
-          backgroundWorkPending = false;
-          sawTaskEventThisTurn = false;
-          if (holdForTurn) {
-            heldForBackgroundWork = true;
-            scheduleRelease();
-          } else {
-            // Either nothing was backgrounded, or the background work just
-            // reported in — let the CLI exit now, as it always has.
-            heldForBackgroundWork = false;
-            releasePromptStream();
-          }
+          // Either nothing was backgrounded, or the background work just
+          // reported in — let the CLI exit now, as it always has.
+          heldForBackgroundWork = false;
+          releasePromptStream();
         }
       } else if (idleReleaseTimer) {
         // Background activity after the turn — push the countdown back out.
