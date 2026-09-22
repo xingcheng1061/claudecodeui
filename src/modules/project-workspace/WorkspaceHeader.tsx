@@ -17,6 +17,8 @@ type WorkspaceHeaderProps = {
   shouldShowBrowserTab: boolean;
   isMobile: boolean;
   onMenuClick: () => void;
+  filesPanelOpen: boolean;
+  onToggleFilesPanel: () => void;
 };
 
 /** Rendered by WorkspaceMain to show the workspace title alongside the scrollable tab bar. */
@@ -29,6 +31,8 @@ export default function WorkspaceHeader({
   shouldShowBrowserTab,
   isMobile,
   onMenuClick,
+  filesPanelOpen,
+  onToggleFilesPanel,
 }: WorkspaceHeaderProps) {
   const { t } = useTranslation();
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -122,6 +126,8 @@ export default function WorkspaceHeader({
                 setActiveTab={setActiveTab}
                 shouldShowTasksTab={shouldShowTasksTab}
                 shouldShowBrowserTab={shouldShowBrowserTab}
+                filesPanelOpen={filesPanelOpen}
+                onToggleFilesPanel={onToggleFilesPanel}
               />
             </div>
             {canScrollRight && (

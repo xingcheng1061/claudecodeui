@@ -124,6 +124,10 @@ export default function WorkspacePathField({
       </div>
 
       <FolderBrowserModal
+        // A fresh mount per open resets the modal's own state (search query,
+        // results) event-free — state persisted across opens would otherwise
+        // show a stale search for the new browse.
+        key={showFolderBrowser ? 'open' : 'closed'}
         isOpen={showFolderBrowser}
         autoAdvanceOnSelect={false}
         onClose={() => setShowFolderBrowser(false)}

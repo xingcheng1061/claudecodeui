@@ -346,7 +346,9 @@ const removeSessionFromProject = (project: Project, sessionIdToDelete: string): 
   return updatedProject;
 };
 
-const VALID_TABS: Set<string> = new Set(['chat', 'files', 'shell', 'git', 'tasks', 'browser']);
+// 'files' is intentionally absent: the file tree is a sidebar toggled beside
+// any view now, not a pane of its own. A persisted 'files' migrates below.
+const VALID_TABS: Set<string> = new Set(['chat', 'shell', 'git', 'tasks', 'browser']);
 
 const isValidTab = (tab: string): tab is AppTab => {
   return VALID_TABS.has(tab) || tab.startsWith('plugin:');
@@ -357,6 +359,11 @@ const readPersistedTab = (): AppTab => {
     const stored = localStorage.getItem('activeTab');
     if (stored && isValidTab(stored)) {
       return stored as AppTab;
+    }
+    // Upgrading users who parked on the old files tab land on chat with the
+    // tree already open, so nothing disappears from view.
+    if (stored === 'files') {
+      localStorage.setItem('files-sidebar-visible', 'true');
     }
   } catch {
     // localStorage unavailable

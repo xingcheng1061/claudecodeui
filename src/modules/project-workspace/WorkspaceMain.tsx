@@ -1,7 +1,7 @@
-import React, { useCallback, useEffect, type Dispatch, type SetStateAction, useState } from 'react';
+import React, { useCallback, useEffect, useRef, type Dispatch, type SetStateAction, useState } from 'react';
 
 import { ChatInterface } from '@/modules/chat';
-import { FileTree } from '@/modules/file-tree';
+import { FilesSidebar } from '@/modules/file-tree';
 import { StandaloneShell } from '@/modules/standalone-shell';
 import { GitPanel } from '@/modules/git-panel';
 import { PluginTabContent } from '@/modules/plugins';
@@ -11,6 +11,7 @@ import { TaskMasterPanel, useTaskMasterProjectSync, useTasksSettings } from '@/m
 import type { AppTab, DirectoryRevealRequest, Project, ProjectSession, SessionEstablishedContext, SessionNavigationOptions, SettingsMainTab } from '@/shared/types';
 import { useUiPreferences } from '@/shared/context/UiPreferencesContext';
 import { useFileOpenResolver } from '@/modules/project-workspace/hooks/useFileOpenResolver';
+import { useResizableWidth } from '@/modules/project-workspace/hooks/useResizableWidth';
 import { EditorSidebar, useEditorSidebar } from '@/modules/code-editor';
 import WorkspaceHeader from '@/modules/project-workspace/WorkspaceHeader';
 import WorkspaceStateView from '@/modules/project-workspace/WorkspaceStateView';
@@ -67,6 +68,42 @@ function WorkspaceMain({
   // so that re-clicking the same folder is a new request the tree acts on.
   const [revealDirectory, setRevealDirectory] = useState<DirectoryRevealRequest | null>(null);
 
+  // The file tree sidebar is permanent furniture now (it sits beside Chat/Shell
+  // rather than replacing them), so its open state and width persist across
+  // visits. Absent from storage defaults to open — the tree is part of the
+  // default workspace.
+  const [filesSidebarOpen, setFilesSidebarOpen] = useState<boolean>(() => {
+    try {
+      return window.localStorage.getItem('files-sidebar-visible') !== 'false';
+    } catch {
+      return true;
+    }
+  });
+  const toggleFilesSidebar = useCallback(() => {
+    setFilesSidebarOpen((open) => {
+      const next = !open;
+      try {
+        window.localStorage.setItem('files-sidebar-visible', String(next));
+      } catch {
+        // localStorage unavailable
+      }
+      return next;
+    });
+  }, []);
+
+  const flexRowRef = useRef<HTMLDivElement | null>(null);
+  const {
+    width: filesSidebarWidth,
+    resizeHandleRef: filesResizeHandleRef,
+    onResizeStart: onFilesResizeStart,
+  } = useResizableWidth({
+    containerRef: flexRowRef,
+    min: 200,
+    maxRatio: 0.5,
+    initialWidth: 280,
+    storageKey: 'files-sidebar-width',
+  });
+
   const shouldShowTasksTab = Boolean(tasksEnabled && isTaskMasterInstalled);
   const shouldShowBrowserTab = browserUseEnabled;
 
@@ -109,9 +146,8 @@ function WorkspaceMain({
   }, [setActiveTab]);
 
   const openFile = useCallback((filePath: string) => {
-    setActiveTab('files');
     handleFileOpen(filePath);
-  }, [handleFileOpen, setActiveTab]);
+  }, [handleFileOpen]);
 
   // Opens the editor side panel in place, keeping the current tab (e.g. chat).
   const openFileInEditor = useCallback((filePath: string, line?: number | null) => {
@@ -120,9 +156,14 @@ function WorkspaceMain({
 
   // Directories cannot be read as text: reveal them in the file tree instead.
   const openDirectory = useCallback((directoryPath: string) => {
-    setActiveTab('files');
     setRevealDirectory({ path: directoryPath });
-  }, [setActiveTab]);
+    setFilesSidebarOpen(true);
+    try {
+      window.localStorage.setItem('files-sidebar-visible', 'true');
+    } catch {
+      // localStorage unavailable
+    }
+  }, []);
 
   // Stable arguments keep usePaletteOpsRegister's effect from tearing down and
   // rewriting the whole palette registry on every render.
@@ -147,9 +188,23 @@ function WorkspaceMain({
         shouldShowBrowserTab={shouldShowBrowserTab}
         isMobile={isMobile}
         onMenuClick={onMenuClick}
+        filesPanelOpen={filesSidebarOpen}
+        onToggleFilesPanel={toggleFilesSidebar}
       />
 
-      <div className="flex min-h-0 flex-1 overflow-hidden">
+      <div ref={flexRowRef} className="flex min-h-0 flex-1 overflow-hidden">
+        {!isMobile && filesSidebarOpen && (
+          <FilesSidebar
+            selectedProject={selectedProject}
+            onFileOpen={handleFileOpen}
+            revealDirectory={revealDirectory}
+            width={filesSidebarWidth}
+            resizeHandleRef={filesResizeHandleRef}
+            onResizeStart={onFilesResizeStart}
+            onClose={toggleFilesSidebar}
+          />
+        )}
+
         <div className={`flex min-h-0 min-w-[200px] flex-col overflow-hidden ${editorExpanded ? 'hidden' : ''} flex-1`}>
           <div className={`h-full ${activeTab === 'chat' ? 'block' : 'hidden'}`}>
             <WorkspaceErrorBoundary showDetails>
@@ -173,26 +228,16 @@ function WorkspaceMain({
             </WorkspaceErrorBoundary>
           </div>
 
-          {activeTab === 'files' && (
-            <div className="h-full overflow-hidden">
-              <FileTree
-                selectedProject={selectedProject}
-                onFileOpen={handleFileOpen}
-                revealDirectory={revealDirectory}
-              />
-            </div>
-          )}
-
-          {activeTab === 'shell' && (
-            <div className="h-full w-full overflow-hidden">
-              <StandaloneShell
-                project={selectedProject}
-                session={selectedSession}
-                showHeader={false}
-                isActive={activeTab === 'shell'}
-              />
-            </div>
-          )}
+          {/* Hidden, not unmounted: the shell's PTY socket survives Chat↔Shell
+              switches, so its scrollback is there when the user comes back. */}
+          <div className={`h-full w-full overflow-hidden ${activeTab === 'shell' ? 'block' : 'hidden'}`}>
+            <StandaloneShell
+              project={selectedProject}
+              session={selectedSession}
+              showHeader={false}
+              isActive={activeTab === 'shell'}
+            />
+          </div>
 
           {activeTab === 'git' && (
             <div className="h-full overflow-hidden">
@@ -236,9 +281,21 @@ function WorkspaceMain({
           onCloseEditor={handleCloseEditor}
           onToggleEditorExpand={handleToggleEditorExpand}
           projectPath={selectedProject.path}
-          fillSpace={activeTab === 'files'}
         />
       </div>
+
+      {isMobile && filesSidebarOpen && (
+        <FilesSidebar
+          overlay
+          selectedProject={selectedProject}
+          onFileOpen={handleFileOpen}
+          revealDirectory={revealDirectory}
+          width={filesSidebarWidth}
+          resizeHandleRef={filesResizeHandleRef}
+          onResizeStart={onFilesResizeStart}
+          onClose={toggleFilesSidebar}
+        />
+      )}
     </div>
   );
 }

@@ -15,6 +15,7 @@ function createFakeServices(overrides: Partial<FileTreeServices> = {}): FileTree
 
   return {
     browseWorkspace: unexpectedOperation,
+    searchWorkspaceFolders: unexpectedOperation,
     createWorkspaceFolder: unexpectedOperation,
     readTextFile: unexpectedOperation,
     openFile: unexpectedOperation,

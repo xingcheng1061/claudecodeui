@@ -12,6 +12,9 @@ type WorkspaceTabsProps = {
   setActiveTab: Dispatch<SetStateAction<AppTab>>;
   shouldShowTasksTab: boolean;
   shouldShowBrowserTab: boolean;
+  /** Whether the files sidebar is open; the files "tab" toggles it rather than switching panes. */
+  filesPanelOpen: boolean;
+  onToggleFilesPanel: () => void;
 };
 
 type BuiltInTab = {
@@ -58,6 +61,8 @@ export default function WorkspaceTabs({
   setActiveTab,
   shouldShowTasksTab,
   shouldShowBrowserTab,
+  filesPanelOpen,
+  onToggleFilesPanel,
 }: WorkspaceTabsProps) {
   const { t } = useTranslation();
   const { plugins } = usePlugins();
@@ -106,7 +111,9 @@ export default function WorkspaceTabs({
       className="min-w-max border border-border/40 bg-muted/50 shadow-inner shadow-black/[0.025] dark:shadow-black/10"
     >
       {tabs.map((tab, index) => {
-        const isActive = tab.id === activeTab;
+        // Files is no longer a pane of its own: its tab toggles the always-mounted
+        // sidebar, so it reads as active while the sidebar is open on any view.
+        const isActive = tab.id === 'files' ? filesPanelOpen : tab.id === activeTab;
         const displayLabel = tab.kind === 'builtin' ? t(tab.labelKey) : tab.label;
 
         return (
@@ -121,7 +128,7 @@ export default function WorkspaceTabs({
                 aria-selected={isActive}
                 tabIndex={isActive ? 0 : -1}
                 isActive={isActive}
-                onClick={() => setActiveTab(tab.id)}
+                onClick={() => (tab.id === 'files' ? onToggleFilesPanel() : setActiveTab(tab.id))}
                 onKeyDown={handleTabKeyDown}
                 className="h-8 max-w-44 px-2.5 py-[5px]"
               >

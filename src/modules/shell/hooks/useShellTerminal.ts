@@ -298,6 +298,13 @@ export function useShellTerminal({
         return;
       }
 
+      // Hidden (display:none) containers measure 0, and fitting into that
+      // reports cols:0 to the backend. When the pane becomes visible again the
+      // ResizeObserver below fires with the real size and fits properly.
+      if (terminalContainer.clientWidth === 0 || terminalContainer.clientHeight === 0) {
+        return;
+      }
+
       currentFitAddon.fit();
       sendSocketMessage(wsRef.current, {
         type: 'resize',
@@ -324,6 +331,12 @@ export function useShellTerminal({
         const currentFitAddon = fitAddonRef.current;
         const currentTerminal = terminalRef.current;
         if (!currentFitAddon || !currentTerminal) {
+          return;
+        }
+
+        // Same zero-size guard as the initial fit: the shell can sit hidden
+        // while Chat is shown, and hidden containers measure 0.
+        if (terminalContainer.clientWidth === 0 || terminalContainer.clientHeight === 0) {
           return;
         }
 
