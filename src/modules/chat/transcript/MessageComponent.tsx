@@ -179,16 +179,14 @@ const MessageComponent = memo(({ message, prevMessage, createDiff, onFileOpen, s
             </span>
           </div>
           {message.compactSummary && (
-            <details className="ml-3.5 mt-0.5">
-              <summary className="cursor-pointer text-xs text-gray-500 hover:text-foreground dark:text-gray-400">
-                {t('chat:misc.compactionSummary', 'full summary')}
-              </summary>
-              <div className="mt-1">
-                <Markdown className="prose prose-sm prose-gray max-w-none font-serif dark:prose-invert">
-                  {message.compactSummary}
-                </Markdown>
-              </div>
-            </details>
+            /* The summary is the compaction's whole output — the official UI reads
+               it as a normal reply, so it is drawn directly instead of folded into
+               a click-to-expand drawer. */
+            <div className="ml-3.5 mt-1">
+              <Markdown className="prose prose-sm prose-gray max-w-none font-serif dark:prose-invert">
+                {message.compactSummary}
+              </Markdown>
+            </div>
           )}
         </div>
       ) : message.isTaskNotification ? (

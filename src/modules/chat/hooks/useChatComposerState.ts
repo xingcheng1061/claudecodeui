@@ -724,7 +724,11 @@ export function useChatComposerState({
                 metadata: { type: 'builtin' },
               } as SlashCommand)
             : undefined);
-        if (matchedCommand && matchedCommand.type !== 'skill') {
+        // CLI-native commands (namespace 'cli') must fall through to the
+        // normal send: the CLI executes them itself, and intercepting them
+        // here would route them into the execute endpoint whose custom
+        // branch resubmits the text — /compact would loop forever.
+        if (matchedCommand && matchedCommand.type !== 'skill' && matchedCommand.namespace !== 'cli') {
           executeCommand(matchedCommand, isHelpAlias ? '/help' : commandInput);
           recordSentMessage(currentInput);
           setInput('');

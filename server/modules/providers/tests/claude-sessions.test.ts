@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -356,6 +356,124 @@ test('Claude history keeps an agent running when its transcript stops mid tool c
       );
 
       assert.equal(agentRow?.subagent?.status, 'running');
+    });
+  } finally {
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('a foreground Bash task event does not become a phantom subagent', async () => {
+  const messages = new ClaudeSessionsProvider().normalizeMessage({
+    uuid: 'evt-bash-1',
+    session_id: SESSION_ID,
+    type: 'system',
+    subtype: 'task_started',
+    task_id: 'task-bash-1',
+    tool_use_id: AGENT_TOOL_USE_ID,
+    task_type: 'local_bash',
+    timestamp: '2026-08-21T10:00:02.000Z',
+  }, SESSION_ID);
+
+  assert.equal(messages.some((message) => message.kind === 'subagent_update'), false);
+});
+
+test('a real agent task event still becomes a subagent update', async () => {
+  const messages = new ClaudeSessionsProvider().normalizeMessage({
+    uuid: 'evt-agent-1',
+    session_id: SESSION_ID,
+    type: 'system',
+    subtype: 'task_started',
+    task_id: 'task-agent-1',
+    tool_use_id: AGENT_TOOL_USE_ID,
+    task_type: 'subagent',
+    timestamp: '2026-08-21T10:00:02.000Z',
+  }, SESSION_ID);
+
+  assert.equal(messages.filter((message) => message.kind === 'subagent_update').length, 1);
+});
+
+test('an agent whose transcript went quiet past the liveness window reads as stopped', { concurrency: false }, async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'claude-quiet-agent-'));
+
+  try {
+    const parentPath = await writeClaudeSubagentSession(tempRoot);
+    await dropTaskNotification(parentPath);
+    const agentPath = path.join(tempRoot, SESSION_ID, 'subagents', `agent-${AGENT_ID}.jsonl`);
+    const agentRaw = await readFile(agentPath, 'utf8');
+    await writeFile(
+      agentPath,
+      `${agentRaw.split('\n').filter((line) => line && !line.includes('tool_result')).join('\n')}\n`,
+      'utf8',
+    );
+    // Age the transcript past the liveness window: the file's own mtime is the
+    // only signal an aborted agent leaves behind.
+    const quiet = new Date(Date.now() - 16 * 60 * 1000);
+    await utimes(agentPath, quiet, quiet);
+
+    await withIsolatedDatabase(async () => {
+      const now = new Date().toISOString();
+      sessionsDb.createSession(SESSION_ID, 'claude', tempRoot, 'Subagent session', now, now, parentPath);
+
+      const history = await new ClaudeSessionsProvider().fetchHistory(SESSION_ID, {
+        providerSessionId: SESSION_ID,
+      });
+      const agentRow = history.messages.find(
+        (message) => message.kind === 'tool_use' && message.toolId === AGENT_TOOL_USE_ID,
+      );
+
+      assert.equal(agentRow?.subagent?.status, 'stopped');
+    });
+  } finally {
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('an aborted orphan agent is re-bound from its sidecar meta', { concurrency: false }, async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'claude-orphan-agent-'));
+
+  try {
+    const parentPath = await writeClaudeSubagentSession(tempRoot);
+    await dropTaskNotification(parentPath);
+
+    // The abort overwrite: the launch result loses its agentId binding, which
+    // is what strands the agent's own transcript and meta as orphans.
+    const parentRaw = await readFile(parentPath, 'utf8');
+    const stripped = parentRaw
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => {
+        if (!line.includes('toolUseResult')) {
+          return line;
+        }
+        const entry = JSON.parse(line) as Record<string, unknown>;
+        entry.toolUseResult = 'User rejected';
+        return JSON.stringify(entry);
+      })
+      .join('\n');
+    await writeFile(parentPath, `${stripped}\n`, 'utf8');
+
+    // The sidecar meta still names the spawning tool call — the whole reason
+    // the re-binding works.
+    await writeFile(
+      path.join(tempRoot, SESSION_ID, 'subagents', `agent-${AGENT_ID}.meta.json`),
+      JSON.stringify({ agentType: 'general-purpose', description: 'Survey the repo', toolUseId: AGENT_TOOL_USE_ID }),
+      'utf8',
+    );
+
+    await withIsolatedDatabase(async () => {
+      const now = new Date().toISOString();
+      sessionsDb.createSession(SESSION_ID, 'claude', tempRoot, 'Subagent session', now, now, parentPath);
+
+      const history = await new ClaudeSessionsProvider().fetchHistory(SESSION_ID, {
+        providerSessionId: SESSION_ID,
+      });
+      const agentRow = history.messages.find(
+        (message) => message.kind === 'tool_use' && message.toolId === AGENT_TOOL_USE_ID,
+      );
+
+      assert.equal(agentRow?.subagent?.id, AGENT_ID);
+      assert.equal(agentRow?.subagent?.status, 'completed');
+      assert.ok((agentRow?.subagentTools?.length ?? 0) > 0, 'the orphan must bring its timeline back');
     });
   } finally {
     await rm(tempRoot, { recursive: true, force: true });

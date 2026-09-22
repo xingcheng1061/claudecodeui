@@ -32,6 +32,9 @@ const NOTHING_LOADED: SubagentStateForSession = {
   requestedAgentIds: [],
 };
 
+/** How often the agent list is re-read while a run is active. */
+const LIST_REREAD_WHILE_RUNNING_MS = 15_000;
+
 /**
  * The viewed session's subagents, read from their own endpoint rather than off whichever
  * slice of the transcript the client has loaded.
@@ -48,7 +51,10 @@ const NOTHING_LOADED: SubagentStateForSession = {
  * `loadActivity` fetches it when a row is opened, and the result is kept, so reopening a
  * row does not ask twice.
  */
-export function useSessionSubagents(sessionId: string | null | undefined): SessionSubagentState {
+export function useSessionSubagents(
+  sessionId: string | null | undefined,
+  isRunActive = false,
+): SessionSubagentState {
   const sessionKey = sessionId ?? null;
   const [state, setState] = useState<SubagentStateForSession>(NOTHING_LOADED);
 
@@ -73,7 +79,7 @@ export function useSessionSubagents(sessionId: string | null | undefined): Sessi
 
     let cancelled = false;
 
-    void (async () => {
+    const fetchList = async () => {
       try {
         const response = await api.providers.sessionSubagents(sessionKey);
         if (!response.ok) {
@@ -93,12 +99,27 @@ export function useSessionSubagents(sessionId: string | null | undefined): Sessi
         // existed, rather than to an error the reader cannot act on.
         console.warn('Failed to load session subagents:', error);
       }
-    })();
+    };
+
+    void fetchList();
+
+    // While a run is active the list is re-read on a fixed interval: agents
+    // spawned mid-turn reach the endpoint only on the next read, and a panel
+    // the reader has pinned open must show them without a session switch. The
+    // interval exists only while the flag is up, and flipping it back down
+    // re-runs this effect, which reads the list one final time.
+    let timer: number | null = null;
+    if (isRunActive) {
+      timer = window.setInterval(() => void fetchList(), LIST_REREAD_WHILE_RUNNING_MS);
+    }
 
     return () => {
       cancelled = true;
+      if (timer !== null) {
+        window.clearInterval(timer);
+      }
     };
-  }, [sessionKey, update]);
+  }, [sessionKey, update, isRunActive]);
 
   const loadActivity = useCallback((agentId: string) => {
     if (!sessionKey || !agentId || current.requestedAgentIds.includes(agentId)) {
@@ -123,20 +144,29 @@ export function useSessionSubagents(sessionId: string | null | undefined): Sessi
         }
         const body = await response.json();
         const activity = body?.data?.activity;
+        const list = Array.isArray(activity) ? activity : [];
         update((existing) => ({
           ...existing,
-          activityByAgent: {
-            ...existing.activityByAgent,
-            [agentId]: Array.isArray(activity) ? activity : [],
-          },
+          activityByAgent: { ...existing.activityByAgent, [agentId]: list },
+          // An empty read is not a completed one: a running agent's transcript
+          // only appears on disk mid-run, so an empty result must not be
+          // remembered as an answer. Dropping the request marker lets the next
+          // expansion retry, while agents with real data keep their one-read
+          // guarantee.
+          requestedAgentIds: list.length === 0
+            ? existing.requestedAgentIds.filter((id) => id !== agentId)
+            : existing.requestedAgentIds,
         }));
       } catch (error) {
-        // Cached as empty so the row stops claiming to be loading. Some providers keep no
-        // per-agent transcript at all, which is an answer rather than a failure.
+        // Cached as empty so the row stops claiming to be loading — but not as
+        // a final answer: the retry marker is dropped for the same reason as
+        // above, and some providers keep no per-agent transcript at all, which
+        // is an answer rather than a failure.
         console.warn('Failed to load subagent transcript:', error);
         update((existing) => ({
           ...existing,
           activityByAgent: { ...existing.activityByAgent, [agentId]: [] },
+          requestedAgentIds: existing.requestedAgentIds.filter((id) => id !== agentId),
         }));
       } finally {
         update((existing) => ({

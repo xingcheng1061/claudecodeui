@@ -234,6 +234,11 @@ const cliNativeCommands = [
   { name: "/doctor", description: "Diagnose the CLI installation" },
   { name: "/bug", description: "Report a bug to Anthropic" },
   { name: "/terminal-setup", description: "Install the Shift+Enter key binding for newlines" },
+  { name: "/context", description: "Show how the context window is currently used" },
+  { name: "/model", description: "Show or set the current model" },
+  { name: "/hooks", description: "Manage hook configuration" },
+  { name: "/rewind", description: "Rewind the conversation to an earlier point" },
+  { name: "/statusline", description: "Configure the status line display" },
 ];
 
 /**
@@ -525,6 +530,11 @@ router.post("/list", async (req, res) => {
 
     res.json({
       builtIn: builtInCommands,
+      // CLI-native commands ride along so the composer's slash menu can list
+      // them; the frontend inserts them into the input instead of executing,
+      // which is what keeps them out of the resubmission loop described on
+      // `cliNativeCommands`.
+      native: cliNativeCommands,
       custom: customCommands,
       count: allCommands.length,
     });

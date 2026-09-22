@@ -122,6 +122,20 @@ export function createProviderRuntimeService(
       return false;
     },
 
+    async isSessionProcessAlive(sessionId: string): Promise<boolean> {
+      // Any provider claiming the session makes it busy — the gateway cannot
+      // know which runtime a resumed process belongs to better than the
+      // runtimes themselves.
+      for (const provider of dependencies.listProviders()) {
+        const check = provider.runtime.isSessionProcessAlive;
+        if (typeof check === 'function'
+          && await check.call(provider.runtime, sessionId)) {
+          return true;
+        }
+      }
+      return false;
+    },
+
     resolveToolApproval(requestId: string, decision: ProviderPermissionDecision): void {
       for (const provider of dependencies.listProviders()) {
         provider.runtime.permissions?.resolve(requestId, decision);

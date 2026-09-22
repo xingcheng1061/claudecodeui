@@ -75,6 +75,7 @@ export type ProviderRuntimeGateway = {
   abort(provider: LLMProvider, sessionId: string): Promise<boolean>;
   abortSubagent(sessionId: string, toolUseId: string): Promise<boolean>;
   injectIntoRunningTurn(sessionId: string, content: string): Promise<boolean>;
+  isSessionProcessAlive(sessionId: string): Promise<boolean>;
   resolveToolApproval(requestId: string, payload: ProviderPermissionDecision): void;
   getPendingApprovalsForSession(sessionId: string): unknown[];
 };
@@ -156,7 +157,65 @@ async function handleChatSend(
     return;
   }
 
-  await dispatchRun(ws, userId, resolved.sessionId, resolved.session, data, dependencies);
+  const result = await dispatchRun(ws, userId, resolved.sessionId, resolved.session, data, dependencies);
+
+  // Locked out by a process still held open for background work. The client
+  // believed the session idle (its run had already reported complete), so it
+  // sent a plain chat.send rather than queueing — queue on its behalf so the
+  // turn is not lost. The dispatcher delivers it the moment the process
+  // exits, and the `queued-updated` broadcast makes the queued card appear
+  // without waiting for the composer's poll.
+  if (result.error === HELD_OPEN_BUSY_ERROR) {
+    queueTurnOnAuthorBehalf(ws, userId, resolved.sessionId, data, dependencies);
+  }
+}
+
+/**
+ * Persists a chat.send turn into the session's queued slot after the
+ * single-writer lock refused it, and tells every open chat socket.
+ *
+ * The composer's own draft text for this session is preserved: only the
+ * queued slot is written, and the queued payload carries the turn's options
+ * through so a later dispatch restores the same model and effort choices.
+ */
+function queueTurnOnAuthorBehalf(
+  ws: WebSocket,
+  userId: string | number | null,
+  sessionId: string,
+  data: AnyRecord,
+  dependencies: ChatWebSocketDependencies
+): void {
+  const content = typeof data.content === 'string' ? data.content : '';
+  const options = data.options && typeof data.options === 'object' && !Array.isArray(data.options)
+    ? data.options as Record<string, unknown>
+    : {};
+
+  // Draft rows are keyed by the numeric user id the REST drafts route uses;
+  // a WS identity that cannot be resolved to one cannot own a queue slot.
+  const numericUserId = typeof userId === 'number' ? userId : Number.parseInt(String(userId ?? ''), 10);
+  if (!content.trim() || !Number.isFinite(numericUserId)) {
+    sendProtocolError(
+      ws,
+      'SESSION_HELD_OPEN',
+      'The session is still finishing background work; the turn could not be queued automatically.',
+      sessionId
+    );
+    return;
+  }
+
+  const existingDraft = sessionDraftsDb
+    .getDrafts(numericUserId)
+    .find((draft) => draft.scope === sessionId);
+  sessionDraftsDb.saveDraft(numericUserId, sessionId, {
+    text: existingDraft?.text ?? '',
+    queuedMessage: { content, options, attachments: [] },
+  });
+
+  for (const connection of connectedClients) {
+    if (connection.readyState === WS_OPEN_STATE) {
+      connection.send(JSON.stringify({ kind: 'queued-updated', sessionId, queued: true }));
+    }
+  }
 }
 
 type ResolvedSendTarget = {
@@ -207,6 +266,15 @@ function resolveSendTarget(
  * `extraRuntimeOptions` is how an edited message asks the provider to resume
  * partway instead of continuing from the tip; a normal send passes nothing.
  */
+/**
+ * dispatchRun's refusal reason when the session's provider process is still
+ * alive past its run's `complete` (held open for background agents). Matched
+ * by identity in `handleChatSend` (queues the turn on the author's behalf)
+ * and by the scheduled-message dispatcher (restores the claim for the next
+ * poll) — export it so the two cannot drift.
+ */
+export const HELD_OPEN_BUSY_ERROR = 'A live provider process still holds this session open.';
+
 async function dispatchRun(
   ws: WebSocket | null,
   userId: string | number | null,
@@ -218,6 +286,20 @@ async function dispatchRun(
   beforeRun?: (run: NonNullable<ReturnType<typeof chatRunRegistry.startRun>>) => void | Promise<void>,
 ): Promise<{ started: boolean; error: string | null }> {
   const provider = session.provider as LLMProvider;
+
+  // Single-writer lock. The registry calls the session idle once the turn's
+  // `complete` has streamed, but a Claude run can keep its CLI process alive
+  // well past that — held open so background agents stay reachable. Spawning
+  // a second process on top would kill the first one's unfinished agents
+  // (which the CLI then re-dispatches on resume, announcing them as lost) and
+  // let two processes write one transcript. Refuse instead: the turn goes to
+  // the queue and the dispatcher retries once the process actually exits.
+  if (!chatRunRegistry.isProcessing(sessionId)) {
+    const processAlive = await dependencies.runtime.isSessionProcessAlive?.(sessionId);
+    if (processAlive) {
+      return { started: false, error: HELD_OPEN_BUSY_ERROR };
+    }
+  }
 
   const run = chatRunRegistry.startRun({
     appSessionId: sessionId,
@@ -515,7 +597,14 @@ async function handleChatQueueInject(
     return;
   }
 
-  if (!chatRunRegistry.isProcessing(sessionId)) {
+  // A run in progress is the ordinary case. A process still held open after
+  // its run's `complete` (background work pending) accepts an injected turn
+  // too — pushing into it is exactly what keeps the single-writer lock from
+  // making the author wait out the background work.
+  const processing = chatRunRegistry.isProcessing(sessionId);
+  const processAlive = processing
+    || await dependencies.runtime.isSessionProcessAlive?.(sessionId);
+  if (!processAlive) {
     sendProtocolError(
       ws,
       'NO_ACTIVE_RUN',

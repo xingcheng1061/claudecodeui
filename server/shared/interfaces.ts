@@ -53,6 +53,14 @@ export interface IProviderRuntime {
    * unsupported rather than quietly falling back to the queue.
    */
   injectIntoRunningTurn?(sessionId: string, content: string): boolean | Promise<boolean>;
+  /**
+   * True while a live provider process still exists for the session — for
+   * Claude, from run start until the stream ends, including the held-open
+   * window after `complete` where background agents keep the process alive.
+   * The chat gateway treats this as session-busy: a second process must never
+   * be spawned on top of a live one, or both write the same transcript.
+   */
+  isSessionProcessAlive?(sessionId: string): boolean | Promise<boolean>;
   permissions?: ProviderRuntimePermissionGateway;
 }
 

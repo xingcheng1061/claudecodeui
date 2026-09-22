@@ -52,6 +52,18 @@ const formatDuration = (milliseconds: number): string => {
  */
 const MAX_TRANSMITTED_SUBAGENT_ACTIVITIES = 200;
 
+/**
+ * How long a subagent's transcript may stay silent (no new writes) before a
+ * history read stops calling the agent `running`.
+ *
+ * An aborted agent's launch result was overwritten with a plain string and no
+ * notification ever arrives, so the transcript's own mtime is the only signal
+ * left. The window exists because a legitimately slow agent also writes
+ * nothing for a while — such an agent is briefly misread as stopped, and its
+ * next write corrects that on the following read.
+ */
+const SUBAGENT_LIVENESS_WINDOW_MS = 15 * 60 * 1000;
+
 type ClaudeToolResult = {
   content: unknown;
   isError: boolean;
@@ -187,6 +199,7 @@ async function readClaudeSubagentTranscript(filePath: string): Promise<ClaudeSub
 type ClaudeSubagentMeta = {
   agentType?: string;
   description?: string;
+  toolUseId?: string;
 };
 
 /** Reads the sidecar `.meta.json` Claude writes next to a subagent transcript. */
@@ -196,6 +209,7 @@ async function readClaudeSubagentMeta(metaPath: string): Promise<ClaudeSubagentM
     return {
       agentType: typeof parsed.agentType === 'string' ? parsed.agentType : undefined,
       description: typeof parsed.description === 'string' ? parsed.description : undefined,
+      toolUseId: typeof parsed.toolUseId === 'string' ? parsed.toolUseId : undefined,
     };
   } catch {
     return {};
@@ -337,6 +351,14 @@ function normalizeClaudeTaskEvent(
 ): NormalizedMessage[] | null {
   const subtype = typeof raw.subtype === 'string' ? raw.subtype : '';
   if (!CLAUDE_TASK_EVENT_SUBTYPES.has(subtype)) {
+    return null;
+  }
+
+  // Foreground Bash commands that run longer than ~2s also surface here as
+  // task events — carrying `task_type: "local_bash"` and the Bash call's own
+  // tool_use_id. They are not agents: forwarding them drew a phantom agent
+  // container around the very tool call the reader was watching.
+  if (readOptionalString(raw.task_type) === 'local_bash') {
     return null;
   }
 
@@ -594,19 +616,22 @@ async function getSessionMessages(
       info: SubagentInfo;
       endedMidToolCall: boolean;
       transcriptFound: boolean;
+      transcriptModifiedAtMs: number | null;
     }>();
     for (const agentId of agentIds) {
       const located = await findClaudeSubagentTranscript(projectDir, providerSessionId, agentId);
-      const [transcript, meta] = located
+      const [transcript, meta, stats] = located
         ? await Promise.all([
           readClaudeSubagentTranscript(located.transcriptPath),
           readClaudeSubagentMeta(located.metaPath),
+          fsp.stat(located.transcriptPath).then((fileStats) => fileStats.mtimeMs).catch(() => null),
         ])
-        : [{ activity: [] as SubagentActivity[], endedMidToolCall: false }, {} as ClaudeSubagentMeta];
+        : [{ activity: [] as SubagentActivity[], endedMidToolCall: false }, {} as ClaudeSubagentMeta, null];
 
       subagentsById.set(agentId, {
         endedMidToolCall: transcript.endedMidToolCall,
         transcriptFound: Boolean(located),
+        transcriptModifiedAtMs: stats,
         activity: transcript.activity
           .slice(0, MAX_TRANSMITTED_SUBAGENT_ACTIVITIES)
           .map(truncateSubagentActivity),
@@ -639,6 +664,13 @@ async function getSessionMessages(
       const subagent = subagentsById.get(String(agentId));
       const toolUseId = readAgentToolUseId(message);
       const notification = toolUseId ? notificationsByToolUseId.get(toolUseId) : undefined;
+      // An agent whose transcript has gone quiet past the liveness window while
+      // ending mid-tool-call is the footprint of an abort: no notification will
+      // ever arrive, so it must not keep the row running. It drops out of the
+      // awaiting test (the row no longer reads as running) and settles as
+      // `stopped` below — a cancellation, not a failure.
+      const transcriptGoneQuiet = subagent?.transcriptModifiedAtMs != null
+        && Date.now() - subagent.transcriptModifiedAtMs > SUBAGENT_LIVENESS_WINDOW_MS;
       // An async agent's launch row never tells you it finished — only the
       // later notification does. When that notification is missing (a live run,
       // or one compacted out of the transcript), the agent's own transcript is
@@ -647,6 +679,7 @@ async function getSessionMessages(
       // running rather than being declared finished on no information.
       const isAwaitingAsyncAgent = message.toolUseResult?.isAsync === true
         && !notification
+        && !transcriptGoneQuiet
         && (!subagent?.transcriptFound || subagent.endedMidToolCall);
       // A notification is terminal by definition, and a cancellation is not a
       // failure: reading every non-completed status as one made a stopped agent
@@ -657,6 +690,9 @@ async function getSessionMessages(
       const terminalStatus = reportedStatus === 'failed' || reportedStatus === 'stopped'
         ? reportedStatus
         : 'completed';
+      const settledStatus: SubagentStatus = transcriptGoneQuiet && subagent?.endedMidToolCall
+        ? 'stopped'
+        : terminalStatus;
 
       if (subagent) {
         if (subagent.activity.length > 0) {
@@ -673,7 +709,7 @@ async function getSessionMessages(
           // the agent's transcript echoes it as a user row the timeline folds
           // away, and the task events never carry it.
           prompt: typeof message.toolUseResult?.prompt === 'string' ? message.toolUseResult.prompt : undefined,
-          status: isAwaitingAsyncAgent ? 'running' : terminalStatus,
+          status: isAwaitingAsyncAgent ? 'running' : settledStatus,
         };
       }
 
@@ -685,6 +721,68 @@ async function getSessionMessages(
         // acknowledgement is internal bookkeeping the user must never read.
         replaceAgentToolResultContent(message, '');
       }
+    }
+
+    // Orphan pass: when an agent is aborted, the CLI overwrites its launch
+    // result with a plain string ("User rejected"), which erases the
+    // toolUseResult.agentId that binds the spawn row to the agent — the row
+    // drops out of the panel on the next read, while the agent's own
+    // transcript and sidecar meta remain on disk as orphans. The meta still
+    // names the spawning tool call, so the row is re-bound from it.
+    //
+    // Per decision: re-bound orphans read as `completed` — the run they were
+    // part of is over and their timeline is all the evidence there is — and
+    // they appear only in history reads (this pass), never in the live panel.
+    const subagentsDirectory = path.join(projectDir, providerSessionId, 'subagents');
+    try {
+      const metaFiles = (await fsp.readdir(subagentsDirectory)).filter((name) => name.endsWith('.meta.json'));
+      for (const metaFile of metaFiles) {
+        const orphanAgentId = metaFile.replace(/^agent-/, '').replace(/\.meta\.json$/, '');
+        if (!orphanAgentId || agentIds.has(orphanAgentId)) {
+          continue;
+        }
+
+        const orphanMeta = await readClaudeSubagentMeta(path.join(subagentsDirectory, metaFile));
+        const orphanToolUseId = orphanMeta.toolUseId;
+        if (!orphanToolUseId) {
+          continue;
+        }
+
+        const spawnRow = messages.find((message) => Array.isArray(message.message?.content)
+          && (message.message.content as AnyRecord[]).some(
+            (part) => part?.type === 'tool_result' && part.tool_use_id === orphanToolUseId,
+          ));
+        if (!spawnRow || spawnRow.subagent) {
+          continue;
+        }
+
+        const located = await findClaudeSubagentTranscript(projectDir, providerSessionId, orphanAgentId);
+        const [orphanTranscript, orphanMetaRead] = located
+          ? await Promise.all([
+            readClaudeSubagentTranscript(located.transcriptPath),
+            readClaudeSubagentMeta(located.metaPath),
+          ])
+          : [{ activity: [] as SubagentActivity[], endedMidToolCall: false, model: undefined }, {} as ClaudeSubagentMeta];
+
+        spawnRow.subagent = {
+          id: orphanAgentId,
+          name: orphanMetaRead.agentType,
+          type: orphanMetaRead.agentType,
+          description: orphanMetaRead.description ?? orphanMetaRead.agentType,
+          model: orphanTranscript.model,
+          toolUseId: orphanToolUseId,
+          // Only the history read assigns this status; the run they belonged to
+          // is over, and no better evidence exists than the timeline itself.
+          status: 'completed',
+          activityCount: orphanTranscript.activity.length,
+        };
+        spawnRow.subagentTools = orphanTranscript.activity
+          .slice(0, MAX_TRANSMITTED_SUBAGENT_ACTIVITIES)
+          .map(truncateSubagentActivity);
+      }
+    } catch {
+      // No subagents directory (or an unreadable one) means no orphans — the
+      // normal case for sessions that never spawned one.
     }
 
     const sortedMessages = messages

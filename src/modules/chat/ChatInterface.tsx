@@ -410,12 +410,21 @@ function ChatInterface({
    * is drawn per session too — and because a list derived from the transcript's paging loses
    * every agent whose spawn row is not loaded, which in a long conversation is most of them.
    */
+  // Only runs that actually spawn agents pay the re-read cost: a run of pure
+  // text has no agent list to refresh.
+  const hasSubagentWork = useMemo(
+    () => chatMessages.some((message) => message.isSubagentContainer || message.subagent),
+    [chatMessages],
+  );
   const {
     subagents,
     activityByAgent,
     loadingAgentIds,
     loadActivity: loadSubagentActivity,
-  } = useSessionSubagents(currentSessionId || selectedSession?.id || null);
+  } = useSessionSubagents(
+    currentSessionId || selectedSession?.id || null,
+    isProcessing && hasSubagentWork,
+  );
 
   const handleStopSubagent = useCallback((toolUseId: string) => {
     const targetSessionId = currentSessionId || selectedSession?.id || null;

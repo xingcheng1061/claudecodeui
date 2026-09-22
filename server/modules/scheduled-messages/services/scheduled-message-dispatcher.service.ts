@@ -1,6 +1,6 @@
 import { scheduledMessagesDb, sessionDraftsDb } from '@/modules/database/index.js';
 import type { QueuedSessionMessageRecord, ScheduledMessageRow } from '@/modules/database/index.js';
-import { chatRunRegistry, runDetachedChatTurn } from '@/modules/websocket/index.js';
+import { HELD_OPEN_BUSY_ERROR, chatRunRegistry, runDetachedChatTurn } from '@/modules/websocket/index.js';
 import type { ProviderRuntimeGateway } from '@/modules/websocket/index.js';
 
 /**
@@ -73,8 +73,11 @@ async function sendClaimedQueuedMessage(
   );
 
   // The registry check and run reservation are separate operations. If a run
-  // wins that tiny race, put the turn back so the next poll tries again.
-  if (!result.started && result.error === 'A run was already in progress for this session.') {
+  // wins that tiny race, put the turn back so the next poll tries again. The
+  // held-open refusal is the same story on a longer clock: a background
+  // agent's process is still finishing, and the turn retries when it exits.
+  if (!result.started && (result.error === 'A run was already in progress for this session.'
+    || result.error === HELD_OPEN_BUSY_ERROR)) {
     sessionDraftsDb.restoreQueuedMessage(candidate);
     return;
   }

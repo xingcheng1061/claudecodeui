@@ -34,6 +34,19 @@ type ProviderSkillsResponse = {
   };
 };
 
+type CommandsListResponse = {
+  builtIn?: SlashCommand[];
+  native?: SlashCommand[];
+  custom?: SlashCommand[];
+};
+
+/**
+ * CLI-native commands are not executed by this app — the CLI handles them when
+ * the text reaches it — so picking one from the menu inserts it into the input
+ * exactly like a skill, instead of routing through the execute endpoint.
+ */
+const isCliNativeCommand = (command: SlashCommand) => command.namespace === 'cli';
+
 const getCommandHistoryKey = (projectName: string) => `command_history_${projectName}`;
 
 const readCommandHistory = (projectName: string): Record<string, number> => {
@@ -176,7 +189,7 @@ export function useSlashCommands({
           throw new Error('Failed to fetch commands');
         }
 
-        const data = await response.json();
+        const data = (await response.json()) as CommandsListResponse;
         const skillsResponse = await api.providers.skills(provider, { workspacePath });
         const skillsData = skillsResponse.ok
           ? ((await skillsResponse.json()) as ProviderSkillsResponse)
@@ -187,6 +200,11 @@ export function useSlashCommands({
           ...((data.builtIn || []) as SlashCommand[]).map((command) => ({
             ...command,
             type: 'built-in',
+          })),
+          ...((data.native || []) as SlashCommand[]).map((command) => ({
+            ...command,
+            namespace: 'cli',
+            type: 'cli',
           })),
           ...skillCommands,
           ...((data.custom || []) as SlashCommand[]).map((command) => ({
@@ -308,7 +326,7 @@ export function useSlashCommands({
 
   const selectCommandFromKeyboard = useCallback(
     (command: SlashCommand) => {
-      if (isSkillCommand(command)) {
+      if (isSkillCommand(command) || isCliNativeCommand(command)) {
         insertCommandIntoInput(command);
         return;
       }
@@ -330,7 +348,7 @@ export function useSlashCommands({
       }
 
       trackCommandUsage(command);
-      if (isSkillCommand(command)) {
+      if (isSkillCommand(command) || isCliNativeCommand(command)) {
         insertCommandIntoInput(command);
         return;
       }

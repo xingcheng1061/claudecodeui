@@ -2029,6 +2029,10 @@ export const claudeRuntime = {
   abort: abortClaudeSDKSession,
   abortSubagent: abortClaudeSubagent,
   injectIntoRunningTurn: injectIntoRunningClaudeTurn,
+  // True from run start until the stream actually ends — including the
+  // held-open window after `complete`, while background agents keep the
+  // process alive. The chat gateway locks new runs out of the session on it.
+  isSessionProcessAlive: isClaudeSDKSessionActive,
   permissions: {
     resolve: resolveToolApproval,
     listPending: getPendingApprovalsForSession,
