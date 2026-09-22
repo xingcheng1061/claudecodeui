@@ -1,4 +1,4 @@
-import path from 'node:path';
+﻿import path from 'node:path';
 
 import type { WebSocket } from 'ws';
 
@@ -76,6 +76,9 @@ export type ProviderRuntimeGateway = {
   abortSubagent(sessionId: string, toolUseId: string): Promise<boolean>;
   injectIntoRunningTurn(sessionId: string, content: string): Promise<boolean>;
   isSessionProcessAlive(sessionId: string): Promise<boolean>;
+  stopBackgroundTask(provider: LLMProvider, sessionId: string, taskId: string): Promise<boolean>;
+  /** Whether a provider runtime still holds background work for the session after its turn ended. */
+  hasBackgroundWork(sessionId: string): boolean;
   resolveToolApproval(requestId: string, payload: ProviderPermissionDecision): void;
   getPendingApprovalsForSession(sessionId: string): unknown[];
 };
@@ -581,14 +584,62 @@ async function handleChatSubagentAbort(
 }
 
 /**
+ * Handles `chat.stop-task`: stops one background task of a session — an
+ * agent, a workflow or a backgrounded command that is still going after its
+ * turn ended. Unlike `chat.abort` there is no run to consult: the task lives
+ * in the provider's held process, which is the only thing that can stop it.
+ * The provider then reports the task as stopped on the session's stream, so
+ * nothing is echoed back here on success.
+ */
+async function handleChatStopTask(
+  ws: WebSocket,
+  data: AnyRecord,
+  dependencies: ChatWebSocketDependencies
+): Promise<void> {
+  const sessionId = readRequiredSessionId(data);
+  if (!sessionId) {
+    sendProtocolError(ws, 'SESSION_ID_REQUIRED', 'chat.stop-task requires a sessionId.');
+    return;
+  }
+
+  const taskId = typeof data.taskId === 'string' ? data.taskId.trim() : '';
+  if (!taskId) {
+    sendProtocolError(ws, 'TASK_ID_REQUIRED', 'chat.stop-task requires a taskId.', sessionId);
+    return;
+  }
+
+  const session = sessionsDb.getSessionById(sessionId);
+  if (!session) {
+    sendProtocolError(ws, 'SESSION_NOT_FOUND', `Session "${sessionId}" was not found.`, sessionId);
+    return;
+  }
+
+  const stopped = await dependencies.runtime.stopBackgroundTask(
+    session.provider as LLMProvider,
+    sessionId,
+    taskId,
+  );
+  if (!stopped) {
+    sendProtocolError(
+      ws,
+      'NO_SUCH_TASK',
+      `Session "${sessionId}" has no running background task "${taskId}".`,
+      sessionId,
+    );
+  }
+}
+
+/**
  * Handles `chat.queue.inject`: pushes the session's queued message into the
  * running turn's stdin, so it starts the moment the present turn ends instead
  * of waiting for the dispatcher's next poll.
  *
- * Only succeeds while a run is actually processing — the message is pushed into
- * that run's held stdin stream — and only for plain text: stdin carries text,
- * so a queued message with attachments would lose its files silently, and
- * losing data is not an acceptable form of expedience.
+ * A run in progress is the ordinary case, and a process still held open after
+ * its run's `complete` (background work pending) accepts an injected turn too
+ * — pushing into it is exactly what keeps the single-writer lock from making
+ * the author wait out the background work. Only plain text injects: stdin
+ * carries text, so a queued message with attachments would lose its files
+ * silently, and losing data is not an acceptable form of expedience.
  *
  * Every failure path reports a protocol error and leaves the queue untouched —
  * the message still goes out the ordinary way when the dispatcher sees the
@@ -608,10 +659,6 @@ async function handleChatQueueInject(
     return;
   }
 
-  // A run in progress is the ordinary case. A process still held open after
-  // its run's `complete` (background work pending) accepts an injected turn
-  // too — pushing into it is exactly what keeps the single-writer lock from
-  // making the author wait out the background work.
   const processing = chatRunRegistry.isProcessing(sessionId);
   const processAlive = processing
     || await dependencies.runtime.isSessionProcessAlive?.(sessionId);
@@ -723,7 +770,11 @@ function handleChatSubscribe(
 
     // Future live events for this run should land on the socket that asked —
     // this is what makes mid-stream page refreshes work for all providers.
-    if (isProcessing) {
+    // A session whose turn ended but whose background work is still going
+    // keeps producing events through the same writer (task progress, the
+    // turn the CLI pushes when a task reports), so a tab opened during that
+    // work attaches too; the registry keeps the run while the work lasts.
+    if (isProcessing || dependencies.runtime.hasBackgroundWork(sessionId)) {
       chatRunRegistry.attachConnection(sessionId, ws);
     }
 
@@ -778,6 +829,7 @@ function handlePermissionResponse(data: AnyRecord, dependencies: ChatWebSocketDe
  * - `chat.abort`               { sessionId }
  * - `chat.subagent-abort`      { sessionId, toolUseId }
  * - `chat.queue.inject`        { sessionId }
+ * - `chat.stop-task`           { sessionId, taskId }
  * - `chat.subscribe`           { sessions: [{ sessionId, lastSeq? }] }
  * - `chat.permission-response` { requestId, allow, updatedInput?, message?, rememberEntry? }
  *
@@ -886,6 +938,9 @@ export function handleChatConnection(
           return;
         case 'chat.queue.inject':
           await handleChatQueueInject(ws, userId, data, dependencies);
+          return;
+        case 'chat.stop-task':
+          await handleChatStopTask(ws, data, dependencies);
           return;
         case 'chat.subscribe':
           handleChatSubscribe(ws, data, dependencies);

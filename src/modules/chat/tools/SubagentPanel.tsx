@@ -8,6 +8,7 @@ import type {
   SubagentInfo,
   SubagentStatus,
   ToolResult,
+  LiveTaskStatus,
 } from '@/shared/types';
 import { cn } from '@/shared/utils';
 import { ToolRenderer } from '@/modules/chat/tools/ToolRenderer';
@@ -28,6 +29,13 @@ type SubagentPanelProps = {
   toolUseId?: string;
   toolResult?: ToolResult | null;
   subagent?: SubagentInfo;
+  /**
+   * The live stream's task status for the row that launched this agent. The
+   * server's `subagent` status is authoritative when present; the live status
+   * covers the window before a background agent's first transcript read, where
+   * the launch row alone must not be read as completion.
+   */
+  taskStatus?: LiveTaskStatus;
   activity?: SubagentActivity[];
   onFileOpen?: (filePath: string, diffInfo?: unknown) => void;
   createDiff: (oldStr: string, newStr: string) => DiffLine[];
@@ -120,6 +128,7 @@ export const SubagentPanel = memo(({
   toolUseId,
   toolResult,
   subagent,
+  taskStatus,
   activity,
   onFileOpen,
   createDiff,
@@ -156,7 +165,10 @@ export const SubagentPanel = memo(({
   const resultText = useMemo(() => readResultText(toolResult?.content), [toolResult?.content]);
 
   const entries = activity ?? [];
-  const status: SubagentStatus = resolveSubagentStatus(subagent?.status, toolResult);
+  const status: SubagentStatus = resolveSubagentStatus(
+    subagent?.status ?? taskStatus?.status,
+    toolResult,
+  );
   const active = isSubagentActive(status);
   const presentation = SUBAGENT_STATUS_PRESENTATION[status];
   const toolCount = entries.filter((entry) => entry.kind === 'tool').length;
@@ -208,7 +220,13 @@ export const SubagentPanel = memo(({
           ) : (
             <presentation.Icon className="h-3 w-3" />
           )}
-          {status === 'completed' && toolCount > 0
+          {status === 'stopped' ? (
+            // Neither a spinner nor a check mark: the agent never reported and
+            // the process it ran in is gone, so there is no outcome to draw.
+            <span title="The run ended before this agent reported back" className="flex items-center gap-1">
+              no result
+            </span>
+          ) : status === 'completed' && toolCount > 0
             ? `${toolCount} ${toolCount === 1 ? 'tool' : 'tools'}`
             : presentation.label}
         </span>

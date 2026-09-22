@@ -1,4 +1,4 @@
-import express, { type Request, type Response } from 'express';
+﻿import express, { type Request, type Response } from 'express';
 
 import { providerAuthService } from '@/modules/providers/services/provider-auth.service.js';
 import { providerCapabilitiesService } from '@/modules/providers/services/provider-capabilities.service.js';
@@ -68,7 +68,35 @@ const parseAgentId = (value: unknown): string => {
       statusCode: 400,
     });
   }
+  return agentId;
+};
 
+/** A workflow run id as the harness mints one (`wf_16fbf852-274`). */
+const WORKFLOW_RUN_ID_PATTERN = /^wf_[A-Za-z0-9-]+$/;
+/** A workflow agent id as the CLI mints one: `a` and sixteen hex digits. */
+const WORKFLOW_AGENT_ID_PATTERN = /^a[0-9a-f]{16}$/;
+
+// Both ids name a file under the session's transcript directory, so nothing
+// outside these shapes may reach the filesystem.
+const parseWorkflowRunId = (value: unknown): string => {
+  const runId = readPathParam(value, 'runId');
+  if (!WORKFLOW_RUN_ID_PATTERN.test(runId)) {
+    throw new AppError('Invalid workflow run id.', {
+      code: 'INVALID_WORKFLOW_RUN_ID',
+      statusCode: 400,
+    });
+  }
+  return runId;
+};
+
+const parseWorkflowAgentId = (value: unknown): string => {
+  const agentId = readPathParam(value, 'agentId');
+  if (!WORKFLOW_AGENT_ID_PATTERN.test(agentId)) {
+    throw new AppError('Invalid workflow agent id.', {
+      code: 'INVALID_WORKFLOW_AGENT_ID',
+      statusCode: 400,
+    });
+  }
   return agentId;
 };
 
@@ -894,6 +922,22 @@ router.get(
     const sessionId = parseSessionId(req.params.sessionId);
     const agentId = parseAgentId(req.params.agentId);
     const result = await sessionsService.fetchSubagentTranscript(sessionId, agentId);
+    res.json(createApiSuccessResponse(result));
+  }),
+);
+
+/**
+ * One workflow agent's timeline, read on demand when its row in the workflow
+ * card is opened. History does not carry it: a run can spawn a dozen agents
+ * with hundreds of tool calls each, and the card only lists them.
+ */
+router.get(
+  '/sessions/:sessionId/workflows/:runId/agents/:agentId',
+  asyncHandler(async (req: Request, res: Response) => {
+    const sessionId = parseSessionId(req.params.sessionId);
+    const runId = parseWorkflowRunId(req.params.runId);
+    const agentId = parseWorkflowAgentId(req.params.agentId);
+    const result = await sessionsService.readWorkflowAgentActivity(sessionId, runId, agentId);
     res.json(createApiSuccessResponse(result));
   }),
 );

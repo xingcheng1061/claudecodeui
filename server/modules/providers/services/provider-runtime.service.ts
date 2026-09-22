@@ -1,4 +1,4 @@
-import { providerRegistry } from '@/modules/providers/provider.registry.js';
+﻿import { providerRegistry } from '@/modules/providers/provider.registry.js';
 import { providerModelsService } from '@/modules/providers/services/provider-models.service.js';
 import { sessionsService } from '@/modules/providers/services/sessions.service.js';
 import type { IProvider } from '@/shared/interfaces.js';
@@ -134,6 +134,17 @@ export function createProviderRuntimeService(
         }
       }
       return false;
+    },
+
+    async stopBackgroundTask(providerName: LLMProvider, sessionId: string, taskId: string): Promise<boolean> {
+      // A runtime that never holds background work has no task to stop.
+      const { runtime } = dependencies.resolveProvider(providerName);
+      return Boolean(await runtime.stopBackgroundTask?.(sessionId, taskId));
+    },
+
+    hasBackgroundWork(sessionId: string): boolean {
+      return dependencies.listProviders().some((provider) =>
+        (provider.runtime.listBackgroundWork?.() ?? []).some((entry) => entry.sessionId === sessionId));
     },
 
     resolveToolApproval(requestId: string, decision: ProviderPermissionDecision): void {
