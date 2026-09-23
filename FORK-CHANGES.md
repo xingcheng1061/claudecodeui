@@ -28,6 +28,7 @@
   - `src/modules/chat/transcript/Reasoning.tsx`（±33）
   - 测试：`thinkingStream`(99)、`thinkingCollapse`(94)、`streamingRowIdentity`(88)、`liveSubagentGrouping`(101)
 - **注意**：upstream 也改了 `useChatRealtimeHandlers`（task_status 折叠），融合结果可参照合并提交 `dd0b388c`。
+- **⚠️ 因果标注**：本项四个子项因果不同——①是流式**修复**的 bug；**②③④是流式功能激活的 bug**（upstream 的显示管线为整段消息设计：单缓冲、无行身份、滚动意图即时执行——整段更新下这些设计无副作用；token 级流式让三个假设同时失效）。因此**流式与 ②③④ 的三项配套修复必须捆绑为一个不可拆分的单元**：只移植流式不移植配套，上线即复现这三个 bug。其余 bug 域（路径/窗口/usage/判停/收杀/Windows/派发/终止/SW）与流式无因果。
 
 ### 3. 上下文窗口分母失真：1M 模型显示"永远快满" ✅
 
