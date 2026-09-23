@@ -1,168 +1,175 @@
-# Fork 变更清单与重做指南
+# Fork 变更清单（按功能域）与重做指南
 
 > 交接对象：在全新 upstream master 上重做 fork 改动的接手 agent / 开发者。
 >
-> 背景：本 fork（`origin`）在 upstream（`siteboon/claudecodeui`）基础上累积了 14 个自有提交。其中部分变更引入了 bug（注入机制的 complete 扣押、shell 常驻挂载等，下文逐条标注），决定**新建文件夹基于 upstream 最新 master 重做**。本文档逐条列出全部变更、每条的当前状态、以及重做时的注意事项。
->
-> 基线事实：
-> - 分叉点（merge-base）：`3ed3be5a`（feat(settings): close settings modal with escape and backdrop click #1164）
-> - 已合并 upstream 至 `6c51fcaa`（feat(1188): let the sidebar be resized #1189），upstream/main 目前无新增
-> - 我们的自有提交共 14 个（+合并提交 1 个），总计约 +6000/−700 行
+> - upstream：`https://github.com/siteboon/claudecodeui.git`；fork：`https://github.com/xingcheng1061/claudecodeui.git`
+> - 行数为 fork 相对 upstream（`6c51fcaa`）的**净变更行数**（增删合计），来源 `git diff upstream/main HEAD --stat`。总计约 +6000/−700 行、95 个文件。
+> - 重做环境：`../claudecodeui-fresh`（upstream 最新 master 干净克隆），基线见其 `SETUP-BASELINE.md`。
+> - 状态标记：✅ 可直接重做 ｜ ⚠️ 需改方案或融合 ｜ ❌ 已回退/被取代，不要重做
 
 ---
 
-## 一、变更总清单（按时间序，一条一条）
+## 一、Bug 修复（12 项）
 
-状态标记：✅ 可直接重做 ｜ ⚠️ 重做时需改方案或注意融合 ｜ ❌ 已回退/已被取代，**不要重做**
+### 1. CLI 路径解析：非 ASCII 用户路径被打碎 ✅
 
-### 1. `41034a59` fix(claude): resolve the CLI path by walking PATH in-process ✅
+- **问题**：`where.exe` 按控制台代码页输出，按 UTF-8 读取会把 `C:\Users\星辰\...` 打碎，找不到 claude CLI。
+- **文件**：`server/shared/claude-cli-path.ts`（±135）；`server/shared/tests/claude-cli-path.test.ts`（±101）
+- **方案**：进程内遍历 PATH（目录序 × PATHEXT 序），空扩展名优先，去重。重做前确认 upstream 是否已自行修复。
 
-- **文件**：`server/shared/claude-cli-path.ts`（新）、`server/shared/tests/claude-cli-path.test.ts`（新）
-- **内容**：废弃 `where.exe` 查找 claude CLI（其输出按控制台代码页编码，按 UTF-8 读取会把 `C:\Users\星辰\...` 这类非 ASCII 安装路径打碎），改为进程内按目录序 × PATHEXT 序遍历 PATH，空扩展名优先（兼容 npm 的 POSIX shim），去重。
-- **状态**：✅ Windows 环境必需。重做前先确认 upstream 是否已自行修复同类问题。
+### 2. 流式输出域：四类显示错乱 ✅
 
-### 2. `39dae270` feat(chat): 流式 reasoning + 思考折叠 + 独立子 agent 面板 ⚠️
+- **问题**：① reasoning 不实时、整段吐；② 多会话/多子 agent 增量拼进同一字符串互相串线；③ 思考块流式期间被重挂、展开丢失；④ 聚焦后流式更新把读者拽回卡片。
+- **文件**：
+  - `claude-runtime.provider.js`（±895，**横跨多个功能域**；本项占 delta 映射：`includePartialMessages`、`content_block_delta → stream_delta/thinking_delta`、`content_block_stop → stream_end`，两种事件形状都处理）
+  - `src/modules/chat/hooks/useChatRealtimeHandlers.ts`（±152：delta 按 sessionId 分桶、子 agent delta 不渲染）
+  - `src/modules/chat/hooks/useChatMessages.ts`（±103，与功能 B1 共用；本项占行身份稳定）
+  - `src/modules/chat/transcript/ChatMessagesPane.tsx`（±50：聚焦滚动 token 一次性消费）
+  - `src/modules/chat/transcript/Reasoning.tsx`（±33）
+  - 测试：`thinkingStream`(99)、`thinkingCollapse`(94)、`streamingRowIdentity`(88)、`liveSubagentGrouping`(101)
+- **注意**：upstream 也改了 `useChatRealtimeHandlers`（task_status 折叠），融合结果可参照合并提交 `dd0b388c`。
 
-- **文件**：39 个，+3362/−152。核心：`server/modules/providers/list/claude/claude-runtime.provider.js`（includePartialMessages、content_block_delta→stream_delta/thinking_delta 映射）、`src/modules/chat/` 下 `useChatMessages.ts`、`SubagentPanel.tsx`、`SubagentsPanel.tsx`、`SubagentFocusContext.tsx`、`useSessionSubagents.ts`、子 agent 转写端点 `fetchSubagentTranscript`。
-- **内容**：reasoning 实时流式（不再整段吐）、thinking 块默认折叠且行身份稳定（流式期间展开不被重挂）、独立子 agent 面板（列表来自独立端点，与转写分页无关；行点击聚焦卡片，缺失卡片可全量加载）。
-- **状态**：⚠️ **重做时最大的融合点**。upstream 已有自己的 `SubagentPanel/SubagentTimeline/WorkflowPanel/BackgroundTasksStrip` + `task_status` 协议。本条的面板体系与其重叠但设计不同（我们的：独立列表端点 + 聚焦跳转 + 按需全量时间线；他们的：launch 行折叠 + workflow journal）。重做时需要先做一个设计决策：**以哪套面板为准**，然后只移植另一方的优点。流式映射部分（delta 映射、折叠）与 upstream 无冲突，可平移。
+### 3. 上下文窗口分母失真：1M 模型显示"永远快满" ✅
 
-### 3. `6417075a` feat(claude): 上下文窗口学习 + forwardSubagentText + CLI 命令清单 ✅
+- **文件**：`server/modules/providers/shared/context-window.ts`（+116 新：按模型学习窗口，优先级 env > 模型学习值 > 最近学习值 > 160000）；`context-window.test.ts`（+103）；`provider-token-usage.service.ts`（±11）；`claude-runtime.provider.js` 的一部分
+- **数据来源**：每轮 `result.modelUsage[<model>].contextWindow`。
 
-- **文件**：`server/modules/providers/shared/context-window.ts`（新）、`claude-runtime.provider.js`、`provider-token-usage.service.ts`、`commands.routes.ts`。
-- **内容**：
-  - 按模型学习上下文窗口（`learnContextWindow/resolveContextWindow/learnContextWindowsFromResult`），来源 `result.modelUsage[<model>].contextWindow`，优先级：`CONTEXT_WINDOW` env > 模型学习值 > 最近学习值 > 160000。修复 1M 窗口模型按 160k 分母显示"永远快满"。
-  - `sdkOptions.forwardSubagentText = true`：子 agent 的 text/thinking 实时进主流（带 parentToolUseId）。
-  - `/help` 列出 CLI 原生命令（namespace `cli`），**不注册进命令面板**（面板命中会走 execute 重提交，/compact 会无限循环）。
-- **状态**：✅ 可平移。`forwardSubagentText` 与 upstream 的 tracker 无冲突。
+### 4. 全 0 usage 清零计数器 + 压缩感知 ✅
 
-### 4. `a21b1d02` feat(claude): 注入 + run 收尾兜底 + abort 收杀 ⚠️（方案已修正，见 #13/#14）
+- **问题**：`/compact` 等本地命令产生全 0 usage 清零计数；压缩轮预算错乱。
+- **文件**：`claude-runtime.provider.js` 的一部分（`isEmptyUsage()` 全 0 跳过；压缩轮 latch + `post_tokens` 作新预算）。
+- **注意**：`compact_boundary` SDK 无类型，防御式读两种形状；与 upstream tracker 有重叠，二选一。
 
-- **文件**：`claude-runtime.provider.js`、`server/shared/interfaces.ts`、`provider-runtime.service.ts`、`chat-websocket.service.ts`、`QueuedMessageCard.tsx`、`ChatComposer.tsx`、`ChatInterface.tsx`。
-- **内容**：
-  - `createHeldPromptStream` 加 `push()`：向活着的 CLI stdin 推后续 turn（CLI stream-input 模式原生支持多 turn）。
-  - 模块级 `heldPromptStreams` 注册表 + `injectIntoRunningClaudeTurn` 导出 + gateway 分发 + `chat.queue.inject` 帧 + 队列卡片「立即发送」按钮。
-  - `settleRunningTasks`：run 结束时把残留任务逐个上报 `stopped`（现已部分被 upstream tracker 取代）。
-  - abort 路径加 `session.instance.close?.()`：SIGKILL 进程组，不只 interrupt 当前 turn。
-- **状态**：⚠️ **此提交的"complete 扣押"设计已被证伪**（见 #13/#14 与 bug 清单第 1 条）。重做时：注入通道可保留，但**不要让任何计数器扣押 complete**（修正版见 #14）；`settleRunningTasks` 与 upstream 的 tracker 二选一；`close()` 保留。
+### 5. 子 agent 卡片"永远转圈" ⚠️ 已被 upstream 取代
 
-### 5. `98defc28` fix(chat): delta 按 sessionId 分桶 + 聚焦「拽回」修复 ✅
+- 我们的方案（transcript mtime 静默窗口）合并时删除；upstream 的 `launchedByLiveRun`（进程感知）更准且已就位。重做动作：无。
 
-- **文件**：`useChatRealtimeHandlers.ts`、`ChatInterface.tsx`、`ChatMessagesPane.tsx`、两个测试。
-- **内容**：`accumulatedStreamRef/accumulatedThinkingRef` 改为 `Map<sessionId, string>` 分桶——原单字符串让多会话/多子 agent 的流式增量交叉拼接；带 parentToolUseId 的 delta 不渲染；`ChatMessagesPane` 聚焦滚动加 `lastScrolledFocusTokenRef` 一次性消费（修"流式时被自动拽回卡片"）。
-- **状态**：✅ 多会话/并发必需。upstream 也改过 `useChatRealtimeHandlers`（+61），重做时需要重新融合（本次合并已经做过一轮，可参考合并结果 `dd0b388c`）。
+### 6. abort 不杀进程组：后台任务成孤儿 ✅
 
-### 6. `285e3747` feat(claude): 模型目录运行时探测 ❌（已回退，保留其快照层）
+- **问题**：`interrupt()` 只停当前 turn，后台子 agent 继续跑/花钱。
+- **文件**：`claude-runtime.provider.js` 的一部分（abort 路径加 `session.instance.close?.()` SIGKILL 进程组，在 interrupt + 宽限期之后）。
 
-- **内容**：运行时 spawn 一次 claude 问 `supportedModels()` 生成目录。
-- **状态**：❌ **探测读得不准，已在 `dee12fae` 回退**。保留的是它的**替代方案**：本地快照 `models.json`（由 `bin/refresh-models.mjs` 手动生成）+ `claude-models.provider.ts` 的 `loadModelsFromFile()`（快照 → 内置目录两层）。重做时：**只做快照方案，绝不做运行时探测**。
+### 7. run 收尾残留任务卡"运行中" ✅（部分被 upstream tracker 取代）
 
-### 7. `2fd6a469` feat(chat): 子 agent 叙述 markdown 化 + 任务提示透出 ✅
+- **问题**：进程结束/崩溃时残留任务永不上报，卡片永远转圈。
+- **文件**：`claude-runtime.provider.js` 的一部分（`settleRunningTasks` 把残留任务发 `subagent_update {status:'stopped'}`，正常结束与异常两路径）。
 
-- **文件**：5 个，+59/−10。
-- **状态**：✅ 小改动。注意 upstream 的 `SubagentPanel` 走 `MarkdownContent`，融合时取一即可。
+### 8. Shell 终端隐藏后尺寸错乱（cols:0 发给后端）✅
 
-### 8. `15c7240e` feat(chat): 面板时间线 transcript 化 + 可拖宽 ✅
+- **文件**：`src/modules/shell/hooks/useShellTerminal.ts`（+13：两处 clientWidth===0 guard）。
 
-- **文件**：`SubagentPanel.tsx`、`SubagentTimeline` 相关、`ChatMessagesPane.tsx`，+126/−66。
-- **状态**：✅。与 upstream 的 `SubagentTimeline.tsx`（新文件）需要二选一或融合。
+### 9. Windows 专项：temp 写保护缺失 + symlink 测试 ✅
 
-### 9. `dee12fae` fix(chat): 单写者锁 + 子 agent 判停 + 命令清单闭环 + 探测回退 ⚠️（混合提交，拆开看待）
+- **问题**：upstream 假设 temp 目录在 `FORBIDDEN_WORKSPACE_PATHS`——POSIX 成立，Windows 的 `os.tmpdir()` 不在；且 Windows 建 symlink 需管理员权限，测试 EPERM。
+- **文件**：`server/shared/utils.ts`（+5：`os.tmpdir()` 入禁止清单）；`server/shared/tests/read-only-roots.test.ts`（±28：EPERM skip）；`server/modules/file-tree/tests/file-tree.service.test.ts`（±14：同）
+- **说明**：upstream 贡献者环境是 macOS/Linux 的 Windows 盲区，纯净版这 4 个测试必挂。
 
-- **文件**：16 个，+444/−281。
-- **内容与状态**：
-  - **单写者锁**（`isSessionProcessAlive` 谓词 + `dispatchRun` 拒绝 + 服务端代为排队 + 广播）：✅ 防双写的核心，保留。重做时注意与 upstream 的 `hasBackgroundWork` 会话保护共存（合并时已是共存形态）。
-  - **子 agent liveness window**（mtime 静默判停）：❌ **已被 upstream 的 `launchedByLiveRun`（进程感知）取代**，合并时删除。不要重做。
-  - **命令清单闭环**（/list 带 native、前端 menu 插入不执行、补 /context /model /hooks /rewind /statusline）：✅。
-  - **模型探测回退**：✅（见 #6）。
+### 10. 队列派发失败消息蒸发 ✅
 
-### 10. `f1b2d515` feat(workspace): 目录搜索 + 文件树侧栏 + 可拖分栏 + shell fit 修正 ⚠️（含一个已回退的坑）
+- **问题**：派发器 claim 后抛错，消息已清空但未发送——静默丢失。
+- **文件**：`scheduled-message-dispatcher.service.ts`（±56 中的一部分：try/catch → 还原重试）。
 
-- **文件**：18 个，+599/−38。
-- **内容与状态**：
-  - **目录选择器搜索**：后端受限递归搜索（深度 4/结果 30/访问 4000，跳过隐藏与重目录）+ 弹窗搜索框。✅。
-  - **FilesSidebar + 可拖分栏**：文件树变常驻侧栏。✅。
-  - **shell 零尺寸 fit 保护**（两处 clientWidth===0 guard）：✅ 保留。
-  - ❌ **同提交引入了"Shell 标签 CSS 隐藏不卸载"**（PTY 跨标签常驻 → shell 进程与会话 CLI 进程并存），已在 `fa4cff25` 回退为条件挂载。**重做时不要引入**。
+### 11. 终止按钮无法终止 held-open 残留进程 ✅
 
-### 11. `ba58ffd8` docs: 已知问题笔记 ✅（文档，按需）
+- **问题**：`chat.abort` 在 registry 无 running run 时拒绝——run 已 complete 但进程残留时前端点终止无效。
+- **文件**：`chat-websocket.service.ts`（±292 中的一部分：run 不在跑时 best-effort 调 `runtime.abort(session.provider)` 杀存留进程，不发终态帧）。
+- **关联**：静默看门狗已按用户决策移除，卡死恢复统一走终止按钮。
 
-### 12. `dd0b388c` merge upstream（新文件夹方案下不存在，仅作参照）
+### 12. Service Worker 无缓存请求返回 undefined ✅
 
-### 13. `f105e0a7` fix(chat): held-open 拒绝时注入优先 ⚠️
-
-- **内容**：单写者锁拒绝时先尝试注入（否则排队）；`chat.queue.inject` 放宽到 held-open 态；claimed 消息派发失败时还原。
-- **状态**：⚠️ 方向正确但**放大了 #14 修的缺陷暴露面**（注入成功但结果永不归来 → 客户端无反馈）。重做时：注入优先可保留，但必须搭配 #14 的"complete 不扣押"，并且认识到 push 本身不保证结果。
-
-### 14. `349dcac5` fix(claude): 注入 turn 只扣进程、不扣 complete ✅（关键修正）
-
-- **内容**：`injectedTurnCount/resultCount` 计数器**降级**——只决定进程是否保持（未回报的注入 turn 提前关 stdin 会丢消息），**complete 回归 `turnCompleteSent` latch（首个 result 即发）**。根因：`push()` 返回 true 只承诺消息进了内存队列，不承诺 CLI 会读它或回 result；原设计拿不可验证的跨进程承诺扣押终态，一次未回应的注入 = 会话永不 complete = 前端无卡片无反馈地转圈。
-- **同时**：run 启动即武装 idle ceiling 的看门狗——**已在 `fa4cff25` 按用户决策移除**（卡死靠前端终止按钮，见 #15）。
-- **状态**：✅ 计数器语义按本条重做。看门狗不要重做。
-
-### 15. `fa4cff25` fix(workspace): shell 离标签卸载 + 终止覆盖残留进程 ✅
-
-- **内容**：
-  - 回退 shell 常驻（见 #10 的 ❌ 项）。
-  - **`chat.abort` 不再因 registry 无 running run 而拒绝**：run 已结束但进程残留（held-open）时，best-effort 杀掉该会话的存留进程（不发终态帧，客户端早已 idle）。这是"卡死可从前端修复"的关键——终止按钮覆盖所有状态。
-- **状态**：✅。
+- **文件**：`public/sw.js`（±26：fetch 失败且无缓存答 504）。
 
 ---
 
-## 二、已知 bug 与遗留问题（重做时的决策点）
+## 二、功能新增（8 项）
 
-1. **注入机制的可靠性**（已缓解，未根除）：`push()` 成功 ≠ CLI 会处理。当前形态下未回应的注入不再扣押 complete（客户端无感），但消息本身可能滞留在 pending 队列直到天花板触发后**丢失**。若要根除：注入改为"只对确认 CLI 空闲时执行"，或接受消息可能丢失并在 UI 上标注。
-2. **SDK 流静默卡死**：run 进行中 CLI 完全静默（不吐消息也不结束）→ 无 result → 靠用户手动点终止（`chat.abort` 现已覆盖所有状态）。专用心跳看门狗（短上界主动 interrupt）被用户决策推迟，如需要再补。
-3. **queue 单槽覆盖**（设计级，未修）：`session_drafts.queued_message` 单列，第二条入队顶掉第一条且服务端无痕。修复方向：多行队列表 + 派发成功才删。
-4. **前端终止按钮可见性**：`isProcessing` 才显示停止按钮；held-open 卡死时前端无按钮（静默杀进程路径需程序触发）。可考虑：检测到进程存活且后台任务挂死时显示终止入口。
-5. **Windows 专项**：`os.tmpdir()` 加入 `FORBIDDEN_WORKSPACE_PATHS`（upstream 缺失，我们已补）；symlink 测试在 Windows 跳过（EPERM）。
-6. **PowerShell 命令层坑**：长命令里的 `&&` 会被命令层吞掉（曾损坏过文件）——批量改代码用编辑工具，不要用 shell here-string。
+### 1. 独立子 agent 面板体系（最大投入）⚠️ 需先做设计决策
+
+- **内容**：子 agent 列表独立端点（与转写分页无关）；行点击聚焦卡片（缺失可全量加载）；内联时间线；聚焦跳转；叙述 markdown 渲染；渲染上限。
+- **文件**：`SubagentsPanel.tsx`（+437 新）；`useSessionSubagents.ts`（±186）；`SubagentPanel.tsx`（±225）；`useChatMessages.ts`（±103 部分：`mergeSubagentState`）；`subagentStatus.ts`（+70 新）；`SubagentFocusContext.tsx`（+28 新）；`liveSubagentGrouping.test`(101)、`subagentStatus.test`(36)；`sessions.service.ts`（±61 部分：`fetchSubagentTranscript`+`listSessionSubagents`）；`provider.routes.ts`（±51 部分：两个端点）；`claude-sessions.provider.ts`（±288 部分：转写读取+卡片构造）
+- **⚠️ 决策点**：upstream 有自己的 `SubagentPanel/SubagentTimeline/WorkflowPanel`（task_status 协议 + workflow journal）。先定以哪套为准再动手；融合结果参照 `dd0b388c`。
+
+### 2. 队列消息"立即发送"（注入活进程）⚠️
+
+- **内容**：run 进行中，队列消息 push 进活 CLI stdin，当前 turn 结束立即执行；complete 不扣押。
+- **文件**：`claude-runtime.provider.js`（±895 部分：`push`/`heldPromptStreams`/`injectIntoRunningClaudeTurn`）；`chat-websocket.service.ts`（±292 部分：`chat.queue.inject` 帧）；`interfaces.ts`（±42 部分）、`provider-runtime.service.ts`（±47 部分）；`QueuedMessageCard.tsx`（±21）、`ChatComposer.tsx`（+4）、`ChatInterface.tsx`（±107 部分）
+- **⚠️ 已知局限**：push 成功不保证 CLI 处理（结果可能不来）——已按"只扣进程不扣 complete"缓解。
+
+### 3. 单写者锁（并发写入保护）✅
+
+- **内容**：run 结束但进程存活时，`dispatchRun` 拒绝 spawn 第二个 CLI 进程，改服务端代为排队 + 广播；防双写污染转写。
+- **文件**：`chat-websocket.service.ts`（±292 部分：`isSessionProcessAlive` 检查 + `HELD_OPEN_BUSY_ERROR`）；`provider-runtime.service.ts`（±47 部分）；`interfaces.ts`（±42 部分）
+- **注意**：与 upstream `hasBackgroundWork` 会话保护共存。
+
+### 4. 上下文窗口自适应 ✅（兼具 bug #3 性质）
+
+- **文件**：同 bug #3。
+
+### 5. /help 列出 CLI 原生命令（19+ 条）✅
+
+- **文件**：`commands.routes.ts`（±58）；`useSlashCommands.ts`（±24：菜单插入不执行，避开 execute 重提交死循环）。
+
+### 6. 目录选择器递归搜索 ✅
+
+- **内容**：≥2 字符防抖；后端受限递归（深度 4 / 结果 30 / 访问 4000，跳过隐藏与重目录），根 = 当前浏览目录；结果带全路径。
+- **文件**：`file-tree.service.ts`（±99 部分：`searchWorkspaceFolders`）；`file-tree.routes.ts`（+7）；`FolderBrowserModal.tsx`（±110）；`WorkspacePathField.tsx`（+4）；`workspaceApi.ts`（+23）；`api.ts`（+11 部分）
+
+### 7. 文件树侧栏 + 可拖分栏 ✅
+
+- **文件**：`FilesSidebar.tsx`（+98 新）；`useResizableWidth.ts`（+123 新）；`WorkspaceMain.tsx`（±95）；`WorkspaceHeader.tsx`（+6）；`WorkspaceTabs.tsx`（±11）；`useProjectsState.ts`（±9）；`WorkspaceTitle.tsx`（−4）
+- **⚠️ 注意**：同批曾引入 Shell 常驻挂载，已回退——重做分栏时不要把 Shell 改成 hidden-not-unmounted。
+
+### 8. 模型目录本地快照 ✅
+
+- **内容**：`models.json` 快照（`bin/refresh-models.mjs` 手动生成）+ `loadModelsFromFile()`（快照 → 内置目录两层）。
+- **文件**：`claude-models.provider.ts`（±82）；`bin/refresh-models.mjs`（+89 新）；`refresh-models.sh`（+5 新）
+- **❌ 不要重做**：运行时 spawn claude 探测 supportedModels（提交 `285e3747`）——读得不准，已回退。
 
 ---
 
-## 三、新文件夹重做操作指南
+## 三、文档与杂项
 
-```bash
-# 1. 基于 upstream 最新 master 新建工作目录
-git clone https://github.com/siteboon/claudecodeui.git ../claudecodeui-fresh
-cd ../claudecodeui-fresh
-git remote add origin <你的 fork 地址>   # 推送目标
+- 架构文档：`docs/architecture/01-websocket-transport.md`(±4)、`02-realtime-stream.md`(±34)、`06-tool-view.md`(±56)、`README.md`(±5)、`providers/README.md`(+33)、`websocket/README.md`(±6)
+- 运行笔记：`已知问题以及待优化项.md/.json`(+136)
+- 类型：`server/shared/types.ts`(±27)、`src/shared/types.ts`(±27)、`server/shared/interfaces.ts`(±42)、`server/shared/utils.ts`(+5)
+- 本文件：`FORK-CHANGES.md`
 
-# 2. 按依赖顺序逐项应用本文档第一节的条目，每项独立提交：
-#    1 → 3(context-window) → 2(流式+面板, 先做面板设计决策) → 5(delta 分桶)
-#    → 7 → 8 → 9(单写者锁+命令清单, 去掉 liveness) → 10(去掉 shell 常驻)
-#    → 4+13+14(注入, 用修正版语义) → 11(文档)
+## 四、已回退 / 已被取代（不要重做）
 
-# 3. 每项应用后：
-npm install        # 注意 package.json 的 allowScripts 白名单（原生模块 postinstall）
-npm run typecheck
-npm test           # 基线：upstream 自带的失败集需先摸清
-npx vitest run
-```
+| 变更 | 原提交 | 状态 |
+|---|---|---|
+| 模型目录运行时探测 | `285e3747` | ❌ 读得不准，`dee12fae` 回退；保留快照方案 |
+| 子 agent mtime 静默窗口 | `dee12fae` 内 | ⚠️ upstream `launchedByLiveRun`（进程感知）取代 |
+| 注入扣押 complete（计数器） | `a21b1d02`/`f105e0a7` 内 | ❌ 设计缺陷（push 不保证结果），`349dcac5` 修正为只扣进程 |
+| Shell 标签 CSS 隐藏不卸载 | `f1b2d515` 内 | ❌ PTY 常驻，`fa4cff25` 回退为条件挂载 |
+| 静默看门狗（run 启动武装天花板） | `349dcac5` 内 | ❌ 用户决策移除：卡死靠前端终止按钮（终止已覆盖所有状态） |
+
+## 五、已知遗留（未修，重做时再决策）
+
+1. **注入可靠性**：push 成功不保证 CLI 处理；结果不来时消息滞留 pending 队列，天花板触发后随流结束丢失。彻底方案：只在确认 CLI 空闲时注入，或接受丢失并在 UI 标注。
+2. **SDK 流静默卡死**：run 中 CLI 完全静默 → 无 result；恢复靠前端终止按钮（已可用）。专用心跳看门狗（短上界主动 interrupt）被推迟。
+3. **queue 单槽覆盖**（设计级）：第二条入队顶掉第一条且服务端无痕。方向：多行队列表 + 派发成功才删。
+4. **终止按钮可见性**：`isProcessing` 才显示；held-open 卡死时前端无按钮（杀进程路径存在但需程序触发）。
+
+## 六、重做环境与验证基线
+
+环境：`e:/Codes_new/claudecodeui-fresh`（upstream 最新 master `6c51fcaa` 干净克隆，已 `npm install`，remotes：origin=upstream、fork=我们的 fork）。基线详见其 `SETUP-BASELINE.md`：
+
+| 项 | 基线 |
+|---|---|
+| typecheck | 0 error |
+| 服务端 `npm test` | 547 例 / 528 过 / **17 失败**（其中约 13 个会被本清单的 bug 修复治愈：temp 写保护 ×2、hold 时序抖动 ×2、symlink EPERM ×2，及既有的 agent flake/credentials 等） |
+| 前端 `npx vitest run` | 78 文件 / 526 例全过 |
+
+## 七、重做顺序与环境坑
+
+**依赖顺序**：bug1 → 功能4(context-window) → bug2(流式) → 功能1(面板，先决策) → 功能5 → bug6/7 → 功能2/3(注入+锁，用修正语义) → 功能6 → 功能7(去掉 shell 常驻) → bug9/10/11/12 → 文档。
 
 **环境坑（全部实测）**：
-- husky：commitlint 正文每行 ≤100 字符（PowerShell 多行信息用反引号 n 拼进单个 `-m`）；lint-staged v16 会把 `git stash create` 的 stdout 当 hash——**不要留"已修改未暂存"的 LF 文件**，否则 `fatal: Needed a single revision` 挡住所有提交。
-- `oxlint` 是主 linter（0 warning 基线）；`npm test` 是 node:test（`tsx --test`，每文件独立进程）。
-- zh-CN 的 i18n 没有 `folderBrowser` 段属正常（回退 en 是既有约定）。
-- models.json 快照方案：改模型后手动跑 `refresh-models.sh`，不要放启动流程。
-- 本仓库历史上有"重建历史"操作：对照提交时用 patch 内容比对，不要假设提交号两边一致。
-
----
-
-## 四、一页速查：重做 vs 放弃
-
-| # | 变更 | 重做？ |
-|---|---|---|
-| 1 | CLI 路径进程内解析 | ✅ |
-| 2 | 流式 reasoning + 子 agent 面板 | ⚠️ 先做面板设计决策 |
-| 3 | 上下文窗口学习 + forwardSubagentText + CLI 命令 | ✅ |
-| 4 | 注入 + settle + close | ⚠️ 用 #14 修正语义；settle 与 tracker 二选一 |
-| 5 | delta 分桶 + 聚焦防拽回 | ✅ |
-| 6 | 模型运行时探测 | ❌ 只做快照方案 |
-| 7 | 叙述 markdown 化 | ✅ |
-| 8 | 面板时间线 transcript 化 + 拖宽 | ✅ |
-| 9 | 单写者锁 + 命令清单 | ✅（liveness 部分不要） |
-| 10 | 目录搜索 + 文件侧栏 + 拖宽 | ✅（shell 常驻不要） |
-| 13 | 注入优先于排队 | ⚠️ 搭配 #14 |
-| 14 | complete 不扣押 | ✅ |
-| 15 | shell 离标签卸载 + abort 全覆盖 | ✅ |
+- commitlint：正文每行 ≤100 字符（PowerShell 多行信息用反引号 n 拼进单个 `-m`）
+- lint-staged v16：把 `git stash create` 的 stdout 当 hash——不要留"已修改未暂存"的 LF 文件，否则 `fatal: Needed a single revision` 挡住所有提交
+- PowerShell 命令层的长命令里 `&&` 会被吞——批量改代码用编辑工具，不要用 shell here-string
+- `oxlint` 0 warning 基线；`npm test` 是 node:test（每文件独立进程）
+- zh-CN i18n 没有 `folderBrowser` 段属正常（回退 en 是既有约定）
+- models.json：改模型后手动跑 `refresh-models.sh`，不要放启动流程
+- 本仓库历史上有"重建历史"操作：对照提交用 patch 内容比对，不要假设提交号两边一致
