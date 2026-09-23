@@ -509,6 +509,13 @@ async function handleChatEditSend(
  * Handles `chat.abort`: cancels the run for one app session and emits the
  * terminal `complete` on its behalf (runtimes skip their own complete for
  * aborted runs, and the registry drops any duplicate).
+ *
+ * A finished run's process can also still be alive — held open for background
+ * work after its `complete` already streamed. The stop button has to be able
+ * to end that too: it is the only repair a stuck session has from the
+ * frontend, and "restart the server" is not an acceptable substitute. No
+ * terminal frame goes out on that path — every client already saw the run's
+ * own `complete`.
  */
 async function handleChatAbort(
   ws: WebSocket,
@@ -522,8 +529,26 @@ async function handleChatAbort(
   }
 
   const run = chatRunRegistry.getRun(sessionId);
-  if (!run || run.status !== 'running') {
-    sendProtocolError(ws, 'NO_ACTIVE_RUN', `Session "${sessionId}" has no active run.`, sessionId);
+  if (run && run.status !== 'running') {
+    // The run is over, but its process may linger held open. Kill whatever the
+    // provider still holds for this session, quietly: the clients are idle.
+    const session = sessionsDb.getSessionById(sessionId);
+    if (session) {
+      await dependencies.runtime.abort(session.provider as LLMProvider, sessionId);
+    }
+    return;
+  }
+
+  if (!run) {
+    // No run and no session row: nothing this request could stop.
+    const session = sessionsDb.getSessionById(sessionId);
+    if (!session) {
+      sendProtocolError(ws, 'NO_ACTIVE_RUN', `Session "${sessionId}" has no active run.`, sessionId);
+      return;
+    }
+    // A live session row without a run: same best-effort kill as above, so an
+    // orphaned held process is reachable by the stop button in every state.
+    await dependencies.runtime.abort(session.provider as LLMProvider, sessionId);
     return;
   }
 

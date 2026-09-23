@@ -1699,13 +1699,6 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
       heldPromptStreams.set(sessionKey(), heldPromptHandle);
     }
 
-    // Silence watchdog backstop: armed from the start and re-armed by every
-    // stream event, so a stream that goes completely quiet — the CLI hung
-    // mid-turn and no `result` will ever arrive — still ends within the
-    // ceiling instead of pinning the client's spinner forever. Activity keeps
-    // pushing it out; only true silence lets it fire.
-    scheduleRelease();
-
     // Process streaming messages
     console.log('Starting async generator loop for session:', capturedSessionId || 'NEW');
     for await (const message of queryInstance) {

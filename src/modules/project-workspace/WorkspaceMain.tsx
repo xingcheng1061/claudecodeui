@@ -228,16 +228,16 @@ function WorkspaceMain({
             </WorkspaceErrorBoundary>
           </div>
 
-          {/* Hidden, not unmounted: the shell's PTY socket survives Chat↔Shell
-              switches, so its scrollback is there when the user comes back. */}
-          <div className={`h-full w-full overflow-hidden ${activeTab === 'shell' ? 'block' : 'hidden'}`}>
-            <StandaloneShell
-              project={selectedProject}
-              session={selectedSession}
-              showHeader={false}
-              isActive={activeTab === 'shell'}
-            />
-          </div>
+          {activeTab === 'shell' && (
+            <div className="h-full w-full overflow-hidden">
+              <StandaloneShell
+                project={selectedProject}
+                session={selectedSession}
+                showHeader={false}
+                isActive
+              />
+            </div>
+          )}
 
           {activeTab === 'git' && (
             <div className="h-full overflow-hidden">
